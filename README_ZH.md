@@ -5,7 +5,7 @@
 > 一个强大的浏览器视频分割标注工具，支持 AI 辅助标注、实时掩码传播和灵活的项目管理。
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
+![Version](https://img.shields.io/badge/version-0.1.0-green.svg)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Frontend](https://img.shields.io/badge/Frontend-React%20%2B%20TypeScript-61DAFB?logo=react)
 
@@ -52,8 +52,8 @@ SAM31_CHECKPOINT_PATH=./checkpoints/sam3.1_multiplex.pt
 
 1. **下载并解压**
    ```bash
-   tar -xzf VideoSegLabeling-1.0.0.tar.gz
-   cd VideoSegLabeling-1.0.0
+   tar -xzf VideoSegLabeling-x.x.x.tar.gz
+   cd VideoSegLabeling-x.x.x
    ```
 
 2. **安装依赖**
@@ -234,8 +234,8 @@ projects/
 
 生成文件：
 ```
-release/VideoSegLabeling-1.0.0/
-release/VideoSegLabeling-1.0.0.tar.gz
+release/VideoSegLabeling-x.x.x/
+release/VideoSegLabeling-x.x.x.tar.gz
 ```
 
 ### 发布特定版本
@@ -477,25 +477,25 @@ git status --porcelain
 
 1. **创建版本标签**
    ```bash
-   git tag v1.0.0
+   git tag vx.x.x
    ```
 
 2. **构建 Release 包**
    ```bash
-   ./build_release.sh 1.0.0
+   ./build_release.sh x.x.x
    ```
 
 3. **推送到 GitHub**
    ```bash
    git push origin main
-   git push origin v1.0.0
+   git push origin vx.x.x
    ```
 
 4. **创建 GitHub Release**
    - 前往 GitHub → Releases → "Create a new release"
-   - 选择 `v1.0.0` 标签
+   - 选择 `vx.x.x` 标签
    - 填写发布说明
-   - 上传 `release/VideoSegLabeling-1.0.0.tar.gz` 文件
+   - 上传 `release/VideoSegLabeling-x.x.x.tar.gz` 文件
    - 点击 "Publish release"
 
 ### 发布清单
@@ -608,7 +608,7 @@ git add package.json package-lock.json
 
 ## 📝 更新日志
 
-### v1.0.0 (当前版本)
+### v0.1.0 (当前版本)
 
 **新功能：**
 - ✨ 完整的视频分割标注工具

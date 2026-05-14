@@ -5,7 +5,7 @@
 > A powerful browser-based video segmentation labeling tool with AI-assisted annotations, real-time mask propagation, and flexible project management.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
+![Version](https://img.shields.io/badge/version-0.1.0-green.svg)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Frontend](https://img.shields.io/badge/Frontend-React%20%2B%20TypeScript-61DAFB?logo=react)
 
@@ -52,8 +52,8 @@ SAM31_CHECKPOINT_PATH=./checkpoints/sam3.1_multiplex.pt
 
 1. **Download and Extract**
    ```bash
-   tar -xzf VideoSegLabeling-1.0.0.tar.gz
-   cd VideoSegLabeling-1.0.0
+   tar -xzf VideoSegLabeling-x.x.x.tar.gz
+   cd VideoSegLabeling-x.x.x
    ```
 
 2. **Install Dependencies**
@@ -234,8 +234,8 @@ projects/
 
 Generated files:
 ```
-release/VideoSegLabeling-1.0.0/
-release/VideoSegLabeling-1.0.0.tar.gz
+release/VideoSegLabeling-x.x.x/
+release/VideoSegLabeling-x.x.x.tar.gz
 ```
 
 ### Release Specific Version
@@ -477,25 +477,25 @@ git status --porcelain
 
 1. **Create version tag**
    ```bash
-   git tag v1.0.0
+   git tag vx.x.x
    ```
 
 2. **Build Release package**
    ```bash
-   ./build_release.sh 1.0.0
+   ./build_release.sh x.x.x
    ```
 
 3. **Push to GitHub**
    ```bash
    git push origin main
-   git push origin v1.0.0
+   git push origin vx.x.x
    ```
 
 4. **Create GitHub Release**
    - Go to GitHub → Releases → "Create a new release"
-   - Select `v1.0.0` tag
+   - Select `vx.x.x` tag
    - Write release notes
-   - Upload `release/VideoSegLabeling-1.0.0.tar.gz`
+   - Upload `release/VideoSegLabeling-x.x.x.tar.gz`
    - Click "Publish release"
 
 ### Release Checklist
@@ -608,7 +608,7 @@ We welcome code contributions, bug reports, and feature suggestions!
 
 ## 📝 Changelog
 
-### v1.0.0 (Current)
+### v0.1.0 (Current)
 
 **New Features:**
 - ✨ Complete video segmentation labeling tool
