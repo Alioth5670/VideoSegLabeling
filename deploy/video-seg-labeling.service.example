@@ -1,0 +1,16 @@
+[Unit]
+Description=Video Segmentation Labeling FastAPI backend
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/video-seg-labeling/backend
+EnvironmentFile=/etc/video-seg-labeling.env
+ExecStart=/opt/video-seg-labeling/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8010
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
