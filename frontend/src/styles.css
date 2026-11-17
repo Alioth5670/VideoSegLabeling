@@ -1558,3 +1558,58 @@ button:disabled,
   .project-manager-toolbar .project-owner-filter { width: auto; }
   .project-search-field { order: 1; flex-basis: 100%; }
 }
+
+.gpu-manager h1 { display: flex; align-items: center; gap: 10px; }
+.gpu-settings { background: white; border: 1px solid #d5dfe3; border-radius: 12px; padding: 24px; margin: 24px 0; }
+.gpu-settings > header, .gpu-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.gpu-settings h2, .gpu-section-heading h2 { font-size: 19px; margin: 0; color: #233741; }
+.gpu-settings p, .gpu-section-heading p { margin: 6px 0 0; color: #647783; line-height: 1.6; font-size: 14px; }
+.gpu-settings fieldset { border: 0; padding: 0; margin: 24px 0 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.gpu-settings label { display: flex; flex-direction: column; gap: 8px; color: #344d5c; font-size: 15px; }
+.gpu-settings .text-input { width: 100%; min-height: 40px; font-size: 15px; }
+.gpu-settings label small { color: #71838e; line-height: 1.5; font-size: 12px; }
+.gpu-pool-toggle > span:last-child { display: flex; align-items: center; gap: 9px; min-height: 40px; }
+.gpu-pool-toggle input { width: 17px; height: 17px; accent-color: #0f766e; }
+.gpu-settings .gpu-settings-note { margin-top: 22px; padding-top: 16px; border-top: 1px solid #e9eef0; }
+.gpu-section-heading { margin: 24px 0 16px; }
+.gpu-device-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.gpu-device { background: white; border: 1px solid #d5dfe3; border-radius: 10px; padding: 20px; min-width: 0; }
+.gpu-device header { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
+.gpu-device strong { font-size: 16px; color: #233741; }
+.gpu-device > small { display: block; overflow: hidden; text-overflow: ellipsis; margin-top: 8px; color: #738590; font-size: 12px; }
+.gpu-state { background: #eef2f4; color: #5a6c78; border-radius: 5px; padding: 3px 7px; font-size: 12px; white-space: nowrap; }
+.gpu-state.free { background: #e8f5ef; color: #217759; }
+.gpu-device dl { display: flex; justify-content: space-between; gap: 16px; margin: 24px 0 14px; }
+.gpu-device dt { font-size: 13px; color: #71838e; }
+.gpu-device dd { margin: 7px 0 0; font-size: 16px; font-variant-numeric: tabular-nums; color: #243d4a; }
+.gpu-device meter { display: block; width: 100%; height: 8px; }
+.gpu-session-table table { table-layout: auto; min-width: 780px; }
+.gpu-session-table .gpu-empty { text-align: center; color: #71838e; height: 100px; }
+.gpu-manager button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+@media (max-width: 1000px) { .gpu-settings fieldset { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .gpu-settings { padding: 16px; } .gpu-settings fieldset { grid-template-columns: 1fr; } }
+
+.account-bar button[aria-pressed="true"] { background: #e3f3ef; border-color: #0f766e; color: #0f655f; }
+.account-manager-table table { min-width: 760px; }
+.account-manager-table .account-col-name { width: 36%; }
+.account-manager-table .account-col-actions { width: 240px; }
+.account-manager-table .project-manager-actions { gap: 12px; }
+.account-manager-table .project-manager-actions button { display: inline-flex; align-items: center; gap: 7px; font-size: 15px; }
+.account-self-tag { display: inline-block; margin-left: 12px; color: #657b89; background: #f0f4f6; border-radius: 5px; padding: 3px 7px; font-size: 12px; vertical-align: middle; }
+.account-status { display: inline-flex; align-items: center; gap: 7px; font-size: 14px; padding: 4px 9px; border-radius: 5px; }
+.account-status i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.account-status.enabled { color: #267354; background: #ecf7f1; }
+.account-status.disabled { color: #7b6470; background: #f5eef1; }
+.account-manager-editor { display: block; padding: 22px; margin-bottom: 22px; }
+.account-editor-heading h2 { margin: 0 0 6px; color: #263e4c; font-size: 18px; }
+.account-editor-heading p { margin: 0; color: #657985; font-size: 14px; line-height: 1.6; }
+.account-manager-editor fieldset { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; border: 0; padding: 0; margin: 20px 0; }
+.account-manager-editor label { min-width: 0; font-size: 15px; color: #344d5c; }
+.account-manager-editor input { min-height: 40px; width: 100%; font-size: 16px; }
+.account-editor-actions { display: flex; gap: 10px; }
+.account-editor-actions button { min-height: 38px; padding: 0 16px; }
+.account-manager-hint { color: #748590; font-size: 14px; }
+@media (max-width: 760px) {
+  .account-manager-editor fieldset { grid-template-columns: 1fr; }
+  .account-manager-footer { flex-wrap: wrap; }
+}

@@ -85,3 +85,7 @@ cd frontend
 npm ci
 npm run build
 ```
+
+## 后台管理
+
+`./start.sh` 默认后台启动，不再依赖 tmux。`./stop.sh` 停止本项目及托管子进程；`./service.sh status` 查看状态，`./service.sh logs` 查看日志，`./service.sh restart` 重启。旧实例先运行 `./stop.sh --legacy` 再启动。更多说明见根目录 README 的“后台启动、停止与日志”。

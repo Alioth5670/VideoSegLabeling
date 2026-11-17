@@ -52,7 +52,7 @@ async def protect_data(request: Request, call_next):
                     project = video_service.load_project(match[1])
                     if not any(v.get("video_id") == video_id for v in project.get("videos", [])):
                         return JSONResponse({"detail": "视频不存在"}, status_code=404)
-            if (path.startswith("/api/sam/") or path.endswith("/sam/backend")) and not user["admin"]:
+            if (path.startswith("/api/sam/") or path.endswith("/sam/backend")) and not (path == "/api/sam/resources" and request.method == "GET") and not user["admin"]:
                 return JSONResponse({"detail": "需要管理员权限"}, status_code=403)
     response = await call_next(request)
     if path.startswith("/api/"):
@@ -73,6 +73,7 @@ app.include_router(exports.router)
 @app.on_event("shutdown")
 def stop_export_workers() -> None:
     export_jobs.shutdown()
+    sam_service.shutdown()
 
 
 @app.get("/api/health")

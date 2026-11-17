@@ -326,6 +326,77 @@ class AccountTests(unittest.TestCase):
         video_service.save_project(project_id, data)
         return project_id, '/api/projects/' + project_id
 
+    def test_gpu_admin_endpoints_require_admin_and_persist_settings(self):
+        from pathlib import Path
+        from dataclasses import replace
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from app.services.sam_pool import SAMPool
+        with tempfile.TemporaryDirectory() as root:
+            config = replace(sam_service.config, projects_dir=Path(root), sam_backend='mock')
+            isolated = SAMPool(config, SimpleNamespace())
+            self.addCleanup(isolated.shutdown)
+            with patch('app.api.sam.sam_service', isolated):
+                self.assertEqual(self.worker.get('/api/sam/admin').status_code, 403)
+                initial = self.admin.get('/api/sam/admin')
+                self.assertEqual(initial.status_code, 200, initial.text)
+                values = initial.json()['settings']
+                self.assertEqual(self.worker.put('/api/sam/admin/settings', json=values).status_code, 403)
+                self.assertFalse(isolated._settings_path.exists())
+                for invalid in ({**values, 'sam_gpu_max_utilization': -1}, {**values, 'unknown': 1}):
+                    self.assertEqual(self.admin.put('/api/sam/admin/settings', json=invalid).status_code, 422)
+                values.update(sam_gpu_devices='0, 2,0', sam_gpu_min_free_mb=23000)
+                saved = self.admin.put('/api/sam/admin/settings', json=values)
+                self.assertEqual(saved.status_code, 200, saved.text)
+                self.assertEqual(saved.json()['settings']['sam_gpu_devices'], '0,2')
+                self.assertTrue(isolated._settings_path.exists())
+                restored = SAMPool(config, SimpleNamespace())
+                self.addCleanup(restored.shutdown)
+                self.assertEqual(restored.config.sam_gpu_min_free_mb, 23000)
+                self.assertEqual(restored.config.sam_gpu_devices, '0,2')
+                self.assertEqual(self.worker.post('/api/sam/admin/sessions/unknown/release', json={'force': True}).status_code, 403)
+                self.assertEqual(self.admin.post('/api/sam/admin/sessions/unknown/release', json={'force': True}).status_code, 404)
+
+    def test_gpu_pool_api_assigns_per_account_and_reports_capacity(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from app.services.sam_pool import GPUCapacityError
+        worker_project, worker_root = self.make_session_project('Worker GPU allocation')
+        # The administrator can label this project using its own isolated session.
+        devices = [{'id': f'GPU-api-{i}', 'index': i, 'label': f'GPU {i}',
+                    'available': True, 'free_memory_mb': 24000} for i in range(2)]
+        def spawn(lease):
+            lease.process = SimpleNamespace(poll=lambda: None, terminate=lambda: None, wait=lambda timeout: 0)
+        try:
+            with patch.object(sam_service, '_active_backend', 'sam3_video'), \
+                 patch.object(sam_service, '_spawn', side_effect=spawn), \
+                 patch.object(sam_service, '_rpc', return_value='native-api'), \
+                 patch.object(sam_service, '_start_reaper'), \
+                 patch('app.services.sam_pool.discover_gpus', return_value=devices):
+                worker = self.worker.post(worker_root + '/sam/session', params={'video_id': 'video-a'})
+                admin = self.admin.post(worker_root + '/sam/session', params={'video_id': 'video-a'})
+                self.assertEqual(worker.status_code, 200, worker.text)
+                self.assertEqual(admin.status_code, 200, admin.text)
+                self.assertNotEqual(worker.json()['session_id'], admin.json()['session_id'])
+                self.assertNotEqual(worker.json()['device'], admin.json()['device'])
+                for client, result in ((self.worker, worker), (self.admin, admin)):
+                    current = client.get(worker_root + '/sam/session', params={'video_id': 'video-a'}).json()
+                    self.assertEqual(current['session']['session_id'], result.json()['session_id'])
+                    self.assertEqual(current['device'], result.json()['device'])
+                resources = self.worker.get('/api/sam/resources')
+                self.assertEqual(resources.status_code, 200)
+                self.assertEqual(resources.json()['free'], 0)
+                self.assertNotIn('owner_id', resources.text)
+                with patch.object(sam_service, 'start_video_session', side_effect=GPUCapacityError('资源忙')):
+                    blocked = self.worker.post(worker_root + '/sam/session', params={'video_id': 'video-a'})
+                    self.assertEqual(blocked.status_code, 409)
+                self.assertEqual(self.worker.post(worker_root + '/sam/session/close', json={'session_id': worker.json()['session_id']}).status_code, 200)
+                self.assertEqual(self.admin.post(worker_root + '/sam/session/close', json={'session_id': admin.json()['session_id']}).status_code, 200)
+        finally:
+            with sam_service._pool_lock:
+                for lease in list(sam_service._leases.values()):
+                    sam_service._dispose(lease)
+
     def test_segment_failure_logs_full_traceback(self):
         from unittest.mock import patch
         project_id, root = self.make_session_project('Segmentation failure logging')

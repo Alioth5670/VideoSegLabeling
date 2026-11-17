@@ -1,26 +1,42 @@
 import { isCurrentProject } from "../utils/project";
-import { BoxSelect, CircleMinus, CirclePlus, MousePointer2, PencilLine, Play, RectangleHorizontal, RotateCcw } from "lucide-react";
+import { BoxSelect, CircleMinus, CirclePlus, MousePointer2, PencilLine, Play, RectangleHorizontal, RotateCcw, Power } from "lucide-react";
 import { useEffect, useState } from "react";
 import axios from "axios";
 import { getHealth } from "../api/health";
-import { getVideoSession, resetSession, startSession } from "../api/sam";
+import { getVideoSession, resetSession, startSession, closeSession, getGPUResources } from "../api/sam";
 import { useAnnotationStore } from "../store/annotationStore";
 import { useProjectStore } from "../store/projectStore";
 
 export default function TopControls() {
   const { project } = useProjectStore();
   const state = useAnnotationStore();
-  const [busy, setBusy] = useState<"session" | "reset" | null>(null);
+  const [busy, setBusy] = useState<"session" | "reset" | "release" | null>(null);
   const [message, setMessage] = useState("");
+  const [resources, setResources] = useState<{ pool: boolean; free: number } | null>(null);
 
   useEffect(() => {
-    getHealth()
-      .then((health) => {
-        state.setBackend(health.sam_backend);
-        state.setSamDevice(health.sam_device);
-        if (health.sam_fallback_error) setMessage(health.sam_fallback_error);
-      })
-      .catch(() => state.setBackend("unreachable"));
+    let active = true;
+    const refresh = () => getGPUResources().then(value => { if (active) setResources(value); }).catch(() => {});
+    refresh();
+    const timer = window.setInterval(refresh, 15000);
+    window.addEventListener("sam-resources-changed", refresh);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener("sam-resources-changed", refresh); };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = () => getHealth().then(health => {
+      if (!active) return;
+      const store = useAnnotationStore.getState();
+      if (!store.sessionId) {
+        store.setBackend(health.sam_backend);
+        store.setSamDevice(health.sam_device);
+      }
+      if (health.sam_fallback_error) setMessage(health.sam_fallback_error);
+    }).catch(() => { if (active && !useAnnotationStore.getState().sessionId) useAnnotationStore.getState().setBackend("unreachable"); });
+    void refresh();
+    window.addEventListener("sam-resources-changed", refresh);
+    return () => { active = false; window.removeEventListener("sam-resources-changed", refresh); };
   }, []);
 
   useEffect(() => {
@@ -44,6 +60,24 @@ export default function TopControls() {
       if (!controller.signal.aborted && isCurrentProject(current.projectId, current.activeVideoId)) setMessage(errorMessage(error));
     });
     return () => controller.abort();
+  }, [project?.projectId, project?.activeVideoId]);
+
+  useEffect(() => {
+    if (!project) return;
+    let active = true;
+    const timer = window.setInterval(async () => {
+      const expected = useAnnotationStore.getState().sessionId;
+      if (!expected) return;
+      try {
+        const result = await getVideoSession(project.projectId, project.activeVideoId);
+        if (!active || !isCurrentProject(project.projectId, project.activeVideoId) || useAnnotationStore.getState().sessionId !== expected) return;
+        if (result.session?.session_id !== expected) {
+          useAnnotationStore.getState().clearSession();
+          setMessage("Session 已释放，请点击 Start Session 重新申请 GPU。");
+        }
+      } catch { /* Keep the session display during temporary network failures. */ }
+    }, 15000);
+    return () => { active = false; window.clearInterval(timer); };
   }, [project?.projectId, project?.activeVideoId]);
 
   async function onSession() {
@@ -83,6 +117,22 @@ export default function TopControls() {
     }
   }
 
+  async function onRelease() {
+    if (!project || !state.sessionId) return;
+    setBusy("release");
+    try {
+      await closeSession(project.projectId, state.sessionId);
+      if (isCurrentProject(project.projectId, project.activeVideoId)) {
+        state.clearSession();
+        setMessage("Session 已关闭，GPU 已释放；已保存的标注保留。");
+      }
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <header className="top-controls">
       <div className="segmented top-prompt-tools">
@@ -101,9 +151,12 @@ export default function TopControls() {
         <button className="command top-session reset" disabled={!project || !state.sessionId || busy !== null} onClick={onResetSession} title="Reset current SAM session">
           <RotateCcw size={18} /> {busy === "reset" ? "Resetting..." : "Reset"}
         </button>
+        <button className="command top-session" disabled={!project || !state.sessionId || busy !== null} onClick={onRelease} title="关闭 session 并释放 GPU，已保存的标注保留">
+          <Power size={18} /> {busy === "release" ? "释放中..." : "释放 GPU"}
+        </button>
       </div>
       <div className="top-status" title={message}>
-        <span>{formatBackendName(state.backend)} · {state.samDevice}</span>
+        <span>{formatBackendName(state.backend)} · {state.samDevice}{resources?.pool ? ` · 空闲 GPU ${resources.free}` : ""}</span>
         <span>Session: {state.sessionId ? state.sessionId.slice(0, 8) : "未启动"}</span>
         {message && <span>{message}</span>}
       </div>

@@ -256,6 +256,10 @@ cp "${ROOT_DIR}/install.sh" "${PACKAGE_DIR}/install.sh"
 cp "${ROOT_DIR}/start.sh" "${PACKAGE_DIR}/start.sh"
 cp "${ROOT_DIR}/start_backend.sh" "${PACKAGE_DIR}/start_backend.sh"
 cp "${ROOT_DIR}/stop.sh" "${PACKAGE_DIR}/stop.sh"
+cp "${ROOT_DIR}/service.sh" "${PACKAGE_DIR}/service.sh"
+cp "${ROOT_DIR}/runtime_env.sh" "${PACKAGE_DIR}/runtime_env.sh"
+mkdir -p "${PACKAGE_DIR}/tools"
+cp "${ROOT_DIR}/tools/service_control.py" "${PACKAGE_DIR}/tools/service_control.py"
 cp "${ROOT_DIR}/projects/.gitkeep" "${PACKAGE_DIR}/projects/.gitkeep"
 cp "${ROOT_DIR}/checkpoints/.gitkeep" "${PACKAGE_DIR}/checkpoints/.gitkeep"
 
@@ -266,7 +270,7 @@ copy_release_docs "zh"
 find "${PACKAGE_DIR}" -type d -name "__pycache__" -prune -exec rm -rf {} +
 find "${PACKAGE_DIR}" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
 
-chmod +x "${PACKAGE_DIR}/install.sh" "${PACKAGE_DIR}/start.sh" "${PACKAGE_DIR}/start_backend.sh" "${PACKAGE_DIR}/stop.sh"
+chmod +x "${PACKAGE_DIR}/install.sh" "${PACKAGE_DIR}/start.sh" "${PACKAGE_DIR}/start_backend.sh" "${PACKAGE_DIR}/stop.sh" "${PACKAGE_DIR}/service.sh"
 
 cd "${RELEASE_ROOT}"
 tar -czf "${ARCHIVE_PATH}" "${NAME}"

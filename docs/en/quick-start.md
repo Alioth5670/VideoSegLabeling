@@ -85,3 +85,7 @@ cd frontend
 npm ci
 npm run build
 ```
+
+## Background management
+
+`./start.sh` now starts in the background without tmux. Use `./stop.sh` to stop managed processes, `./service.sh status` for status, `./service.sh logs` for logs, and `./service.sh restart` to restart. For an old manual/tmux instance, run `./stop.sh --legacy` before the first new start. See the root README for systemd setup and lifecycle details.

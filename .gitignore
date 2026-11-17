@@ -30,3 +30,6 @@ checkpoints/*
 
 release/
 dist/
+
+# Local background service process metadata
+.run/

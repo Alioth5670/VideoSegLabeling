@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${ROOT_DIR}/runtime_env.sh"
 
 if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
   # Make Node 18+ available even when this script is started from a non-interactive shell.

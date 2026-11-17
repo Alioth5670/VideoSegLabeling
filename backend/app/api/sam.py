@@ -12,7 +12,11 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.api.deps import annotation_store, sam_service, settings, video_service
+from app.api.deps import annotation_store, sam_service, settings, video_service, account_store
+from app.services.sam_pool import GPUCapacityError
+from app.services.gpu_resources import GPUResourceError
+from app.services.gpu_settings import GPUSettings
+from app.api.auth import admin_user
 from app.schemas.sam import PropagateRequest, SegmentRequest
 from app.utils.mask import area_from_mask, bbox_from_mask, polygons_from_mask, save_mask_png
 from app.utils.paths import mask_path, project_dir, rel_to_project
@@ -39,6 +43,54 @@ class ResetSessionRequest(BaseModel):
 
 
 status_router = APIRouter(prefix="/api/sam", tags=["sam"])
+
+
+class AdminReleaseRequest(BaseModel):
+    force: bool = False
+
+
+@status_router.get('/admin')
+def admin_gpu_snapshot(request: Request) -> dict:
+    admin_user(request)
+    snapshot = sam_service.admin_snapshot()
+    users = {user['id']: user['username'] for user in account_store.users()}
+    for session in snapshot['sessions']:
+        session['username'] = users.get(session['owner_id'], session['owner_id'])
+        record = account_store.project_record(session['project_id'], include_deleted=True)
+        session['project_name'] = record['name'] if record else session['project_id']
+    return snapshot
+
+
+@status_router.put('/admin/settings')
+def save_admin_gpu_settings(payload: GPUSettings, request: Request) -> dict:
+    admin_user(request)
+    try:
+        return {'settings': sam_service.update_admin_settings(payload)}
+    except GPUCapacityError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        logger.exception('Failed to save GPU settings')
+        raise HTTPException(500, '配置保存失败，请检查存储目录权限。') from exc
+
+
+@status_router.post('/admin/sessions/{session_id}/release')
+def admin_release_gpu_session(session_id: str, payload: AdminReleaseRequest, request: Request) -> dict:
+    admin_user(request)
+    try:
+        sam_service.admin_release_session(session_id, force=payload.force)
+    except GPUCapacityError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {'ok': True}
+
+
+@status_router.get('/resources')
+def gpu_resources() -> dict:
+    devices = sam_service.available_devices()
+    return {'devices': devices, 'free': sum(bool(device['available']) for device in devices),
+            'pool': sam_service.config.sam_gpu_pool and sam_service.backend_name() != 'mock',
+            'idle_seconds': sam_service.config.sam_session_idle_seconds}
 
 
 @status_router.post("/backend")
@@ -93,13 +145,14 @@ def _check_video_session(project_id: str, session_id: str | None, video_id: str 
 
 
 @router.get('/session')
-def current_session(project_id: str, video_id: str | None = Query(default=None)) -> dict:
-    return {'session': sam_service.find_video_session(project_id, _session_frames(project_id, video_id)),
-            'backend': sam_service.backend_name(), 'device': sam_service.device_name()}
+def current_session(project_id: str, request: Request, video_id: str | None = Query(default=None)) -> dict:
+    session = sam_service.find_video_session(project_id, _session_frames(project_id, video_id), owner_id=request.state.user['id'])
+    return {'session': session, 'backend': (session or {}).get('backend', sam_service.backend_name()),
+            'device': (session or {}).get('device', sam_service.device_name())}
 
 
 @router.post("/session")
-def start_session(project_id: str, video_id: str | None = Query(default=None)) -> dict:
+def start_session(project_id: str, request: Request, video_id: str | None = Query(default=None)) -> dict:
     try:
         root = project_dir(settings.projects_dir, project_id)
         resolved_video_id = video_service.active_video_id(project_id, video_id)
@@ -107,14 +160,19 @@ def start_session(project_id: str, video_id: str | None = Query(default=None)) -
         if not video:
             raise ValueError("No video selected")
         base = video_service.video_path(project_id, resolved_video_id) if resolved_video_id else root
-        session_id = sam_service.start_video_session(project_id, str(root / video["video_path"]), str(base / "frames"))
+        session_id = sam_service.start_video_session(project_id, str(root / video["video_path"]), str(base / "frames"), owner_id=request.state.user["id"])
+    except GPUCapacityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GPUResourceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session = sam_service.find_video_session(project_id, str(base / "frames"), owner_id=request.state.user["id"]) or {}
     return {
         "session_id": session_id,
-        "object_ids": (sam_service.find_video_session(project_id, str(base / 'frames')) or {}).get('object_ids', []),
-        "backend": sam_service.backend_name(),
-        "device": sam_service.device_name(),
+        "object_ids": session.get("object_ids", []),
+        "backend": session.get("backend", sam_service.backend_name()),
+        "device": session.get("device", sam_service.device_name()),
         "video_supported": sam_service.is_video_supported(),
         "multiplex_supported": sam_service.is_multiplex_supported(),
         "fallback_error": sam_service.fallback_error(),

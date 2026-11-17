@@ -63,7 +63,7 @@ venv-server/bin/python -m pip install -r requirements.txt
 ./start.sh
 ```
 
-Stop the old backend before starting the updated service. With `frontend/dist` present, `./start.sh` serves the built UI through the backend. Use `./start.sh --dev` for both development servers in tmux. Check the startup log and `BACKEND_PORT` in `.env` for the address; the example configuration uses 8010. The current local launcher activates `venv-server`; a fresh installation can create it and build the UI with `VENV_DIR="$PWD/venv-server" ./install.sh --build-frontend`.
+Stop the old backend before starting the updated service. With `frontend/dist` present, `./start.sh` serves the built UI through the backend. Use `./start.sh --dev` to supervise both development servers in the background without tmux. Check the startup log and `BACKEND_PORT` in `.env` for the address; the example configuration uses 8010. The launcher selects Python from `venv-server` or `.venv` without manual activation; a fresh installation can create it and build the UI with `VENV_DIR="$PWD/venv-server" ./install.sh --build-frontend`.
 
 Before upgrading, stop the service and back up all of `PROJECTS_DIR` and registered custom project directories, including hidden `.accounts.sqlite3`, per-video `annotations.sqlite3`, videos, and masks. Legacy `annotations.json` alone does not include new annotations. Account and annotation databases migrate automatically. In-memory SAM sessions do not survive backend restarts.
 
@@ -108,9 +108,9 @@ Each video's `annotations.sqlite3` is the source of truth. On first access, exis
 
 COCO RLE uses vectorized NumPy operations. PNG files are stored without ZIP recompression; JSON uses fast compression. Unchanged exports reuse completed archives, with at most two cached versions per format.
 
-Official SAM3/SAM3.1 initialization now uses demand-loaded CPU frames (default cache: 8), without a full-video loading thread. The official per-frame metadata and initial checkpoint load still take time. A repeated session request reuses the current video. Browsing another video/project leaves the live session intact; returning restores its session ID and tracked object list. Explicitly starting a different video session, closing it, or switching model/device releases the previous state. Reset keeps the session ID but clears tracked objects. Model operations are mutually exclusive. Official tracker state offload defaults to CPU, and recent backbone features are bounded (default: 4 frames). Streaming propagation saves masks immediately, uses a bounded event queue, and cancels when the client disconnects. OOM releases the session and asks for a new one rather than silently using mock masks.
+Official SAM3/SAM3.1 initialization now uses demand-loaded CPU frames (default cache: 8), without a full-video loading thread. The official per-frame metadata and initial checkpoint load still take time. With the default GPU pool, session rules apply per account. A repeated session request reuses the current video. Browsing another video/project leaves the live session intact; returning restores its session ID and tracked object list. Explicitly starting a different video session, closing it, or switching model/device releases the previous state. Reset keeps the session ID but clears tracked objects. Model operations are mutually exclusive. Official tracker state offload defaults to CPU, and recent backbone features are bounded (default: 4 frames). Streaming propagation saves masks immediately, uses a bounded event queue, and cancels when the client disconnects. OOM releases the session and asks for a new one rather than silently using mock masks.
 
-Configure `SAM_FRAME_CACHE_SIZE`, `SAM_FEATURE_CACHE_SIZE`, and `SAM_OFFLOAD_STATE_TO_CPU` in the backend environment. Detailed per-frame mask logging is disabled by default to avoid extra GPU synchronization; enable `SAM_DEBUG_LOGGING=true` when diagnosing model outputs. CPU offload trades some propagation speed for lower VRAM usage; model weights, frame resolution, and object count must still fit the GPU. Use one backend process for the shared GPU model. Restart the backend and rebuild/refresh the frontend after updating; old annotations migrate on access.
+Configure `SAM_FRAME_CACHE_SIZE`, `SAM_FEATURE_CACHE_SIZE`, and `SAM_OFFLOAD_STATE_TO_CPU` in the backend environment. Detailed per-frame mask logging is disabled by default to avoid extra GPU synchronization; enable `SAM_DEBUG_LOGGING=true` when diagnosing model outputs. CPU offload trades some propagation speed for lower VRAM usage; model weights, frame resolution, and object count must still fit the GPU. Use one API worker; the default GPU pool runs each account’s model in an isolated child process. Restart the backend and rebuild/refresh the frontend after updating; old annotations migrate on access.
 
 
 ## Background export jobs
@@ -151,3 +151,64 @@ The SAM3.1 adapter preserves consolidated interactive corrections and per-object
 ## SAM3.1 device compatibility and diagnostics
 
 The backend adapter aligns mux/demux conversion matrices with the input cache device and dtype during multiplex state transitions, then restores the original matrix, keeping offloaded caches on CPU. Segmentation failures now log a full traceback with project, video, session, frame, and object identifiers. CPU regression tests cover the adapter; real CUDA inference has not been validated locally.
+
+## On-demand multi-user GPU pool
+
+Real SAM backends enable the pool by default. The web process does not load a CUDA model. **Start Session** creates an isolated inference process on an available GPU: at most one session per account and one worker per physical GPU. Accounts can infer concurrently on separate cards. Starting another video replaces only that account's session; browsing leaves it intact.
+
+Discovery uses `nvidia-smi`, excluding GPUs with compute processes and requiring at least 12000 MiB free, at most 512 MiB used, and utilization at most 5% by default. Eligible GPUs are selected by free memory, with in-process reservations and host file locks. Unknown driver state fails closed. No capacity returns HTTP 409; this version does not queue requests. MIG scheduling is unsupported.
+
+```env
+SAM_GPU_POOL=true
+SAM_GPU_DEVICES=0,1,2,3
+SAM_GPU_MIN_FREE_MB=12000
+SAM_GPU_MAX_USED_MB=512
+SAM_GPU_MAX_UTILIZATION=5
+SAM_SESSION_IDLE_SECONDS=600
+SAM_WORKER_TIMEOUT_SECONDS=600
+SAM_GPU_LOCK_DIR=/tmp/video-seg-labeling-gpu-locks
+```
+
+The allowlist accepts physical `nvidia-smi` indices or full GPU UUIDs; empty means all reported GPUs. Each worker gets its own `CUDA_VISIBLE_DEVICES` and uses local `cuda:0`, independently of the web server's visibility mask. Memory thresholds control admission, not peak usage or OOM prevention.
+
+The toolbar shows free capacity and the allocated device. **释放 GPU** closes the session and exits its process, releasing weights and caches. Reset only clears tracking state. Sessions expire after 600 seconds without inference, checked roughly every 15 seconds; loading and running inference never expire. Reading status does not extend a lease. Saved annotations remain; restarting requires new prompts. Failed or timed-out inference releases the session. Workers exit on normal shutdown or when they detect their parent process has disappeared.
+
+Run one API worker per deployment. Cooperating instances must share the lock directory. These locks cannot reserve hardware against unrelated training applications; use dedicated GPU allowlists or a cluster scheduler for enforced isolation. Pool mode disables manual device switching, and changing the shared backend requires all sessions to be released. Set `SAM_GPU_POOL=false` for legacy single-process behavior without these isolation/release guarantees.
+
+No new dependencies are required. Restart the backend and rebuild the frontend after updating. CPU tests cover scheduling, IPC, and resource cleanup; real multi-GPU CUDA inference still requires deployment validation. These pool rules supersede the legacy shared-model/session behavior described above.
+
+### Administrator GPU settings
+
+Administrators can open **GPU 管理** in the top bar to configure the backend, pool mode, GPU allowlist, memory/utilization admission thresholds, idle expiry, and worker response timeout. The page shows physical GPU telemetry and account/project session assignments. Ordinary accounts cannot access its configuration or administrative release APIs.
+
+Changes are atomically saved to `PROJECTS_DIR/.gpu-settings.json` and override corresponding environment defaults after restart; include this hidden file in backups. No restart is needed for policy changes. The host lock directory remains an environment-level deployment setting. Allowlist changes affect future allocations; idle expiry applies to existing sessions. Switching backend or pool mode requires all sessions to be released. Switching from a legacy model already loaded in the web process additionally requires a backend restart first.
+
+Administrators can release idle sessions or explicitly confirm **强制释放** to interrupt busy workers. Saved annotations remain; unsaved results can be lost. Regular users retain automatic GPU allocation and release of their own sessions.
+
+## Background service control
+
+```bash
+./start.sh                 # Start in background; survives SSH disconnects
+./service.sh status        # Status and URL
+./service.sh logs          # Follow logs; Ctrl+C only stops the log viewer
+./service.sh restart       # Interrupt current tasks and restart
+./stop.sh                  # Stop managed processes and children
+```
+
+For the first migration from tmux/manual launches, finish running tasks, run `./stop.sh --legacy`, then `./start.sh`. Legacy cleanup matches this checkout's backend/frontend working directories and known entrypoints; it never kills by port or closes unrelated tmux sessions.
+
+Release mode requires a built `frontend/dist`; build with `(cd frontend && npm ci && npm run build)`. `./start.sh --dev` supervises both development servers. Use `--foreground` for foreground operation. Launchers consistently read `.env` and select `venv-server` or `.venv`, or `PYTHON_BIN` for a custom interpreter. Absolute script paths work from other directories. Runtime metadata lives in `.run/`, logs in `logs/service.log`; both are excluded from Git.
+
+Without systemd, a detached supervisor restarts failed children after five seconds. Duplicate starts are idempotent; occupied ports cause an error rather than killing their owners. Stop sends a termination signal, waits up to roughly 25 seconds, then cleans up remaining managed process groups. This mode survives SSH disconnection, but not a host reboot.
+
+On a Linux host running systemd, install boot-time startup once, using an account with access to the checkout, data, and GPUs:
+
+```bash
+./stop.sh
+sudo ./service.sh install-systemd --user YOUR_LOGIN_USER
+./start.sh
+```
+
+The same start/stop/status/restart/logs commands then delegate to systemd, with logs in the journal. Installation enables boot startup; `./start.sh` starts it immediately. The systemd service runs release mode. For development, use the backend/frontend launchers directly. Containers without a running systemd should use the default detached mode.
+
+Keeping the web service running does not load a GPU model: inference continues to follow the administrator's on-demand GPU pool policy.

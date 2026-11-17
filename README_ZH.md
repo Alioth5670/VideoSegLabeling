@@ -63,7 +63,7 @@ venv-server/bin/python -m pip install -r requirements.txt
 ./start.sh
 ```
 
-先停止旧后端，再启动更新后的服务。`./start.sh` 检测到 `frontend/dist` 时由后端统一提供页面；`./start.sh --dev` 使用 tmux 启动前后端开发服务。访问地址以启动日志和 `.env` 中的 `BACKEND_PORT` 为准，示例配置为 8010。当前本地启动脚本会激活 `venv-server`；首次安装可用 `VENV_DIR="$PWD/venv-server" ./install.sh --build-frontend` 创建该环境并构建前端。
+先停止旧后端，再启动更新后的服务。`./start.sh` 检测到 `frontend/dist` 时由后端统一提供页面；`./start.sh --dev` 在后台托管前后端开发服务，无需 tmux。访问地址以启动日志和 `.env` 中的 `BACKEND_PORT` 为准，示例配置为 8010。启动脚本自动选择 `venv-server` 或 `.venv` 中的 Python，无需手动激活；首次安装可用 `VENV_DIR="$PWD/venv-server" ./install.sh --build-frontend` 创建该环境并构建前端。
 
 升级前停止服务并备份整个 `PROJECTS_DIR` 和登记的自定义项目目录，包括隐藏的 `.accounts.sqlite3`、各视频的 `annotations.sqlite3`、视频及 masks。仅备份旧 `annotations.json` 无法保留升级后的新增标注。账户与标注数据库自动迁移；内存中的 SAM session 不跨后端重启保留。
 
@@ -116,9 +116,9 @@ COCO RLE 改用 NumPy 向量计算；ZIP 中的 PNG 直接打包，JSON 使用�
 
 SAM3 与 SAM3.1 都通过本地官方 `init_state` 初始化，保留其 tracker 和交互状态，仅在初始化期间替换帧来源。图片按需解码，默认最多缓存 8 张 CPU 帧，不再同步解码整段视频，也不会启动后台线程加载所有帧。官方模型仍需创建逐帧的轻量元数据，因此启动时间仍会随帧数增长；首次加载 checkpoint 也仍需时间。
 
-真实模型共用一个视频 session：重复启动当前视频会复用 session。仅浏览、切换视频或项目不会关闭 session，切回原视频时会自动恢复其 session 和可传播目标；只有显式启动另一个视频的 session、关闭 session 或更换模型/设备时才释放旧状态。重置会保留 session 编号并清空模型中的目标。分割、传播与模型切换互斥，避免请求同时占用显存。默认通过官方 tracker 的 `offload_state_to_cpu` 参数把跟踪状态保存在 CPU，保留至多 4 帧近期 backbone 特征。传播通过回调及时保存，后端不再持有全视频的 mask 数组；事件队列有容量限制，客户端断开会取消任务并关闭模型传播生成器。CUDA OOM 会释放 session 并提示重新启动，不会把本次推理静默替换为 mock。
+关闭 GPU 池的旧单进程模式下，真实模型共用一个视频 session：重复启动当前视频会复用 session。仅浏览、切换视频或项目不会关闭 session，切回原视频时会自动恢复其 session 和可传播目标；只有显式启动另一个视频的 session、关闭 session 或更换模型/设备时才释放旧状态。重置会保留 session 编号并清空模型中的目标。分割、传播与模型切换互斥，避免请求同时占用显存。默认通过官方 tracker 的 `offload_state_to_cpu` 参数把跟踪状态保存在 CPU，保留至多 4 帧近期 backbone 特征。传播通过回调及时保存，后端不再持有全视频的 mask 数组；事件队列有容量限制，客户端断开会取消任务并关闭模型传播生成器。CUDA OOM 会释放 session 并提示重新启动，不会把本次推理静默替换为 mock。
 
-可配置 `SAM_FRAME_CACHE_SIZE`、`SAM_FEATURE_CACHE_SIZE` 和 `SAM_OFFLOAD_STATE_TO_CPU`（见 `.env.example`）。默认关闭逐帧 mask 诊断日志，避免为日志额外复制和同步 GPU 数据；调试时可设置 `SAM_DEBUG_LOGGING=true`。CPU offload 会降低部分传播速度，但能减少显存占用。这些控制不能保证任意分辨率、任意目标数量都不会 OOM；大模型本身、当前帧和目标数量仍需容纳于显存。当前仅支持单个后端进程持有共享 GPU 模型。
+可配置 `SAM_FRAME_CACHE_SIZE`、`SAM_FEATURE_CACHE_SIZE` 和 `SAM_OFFLOAD_STATE_TO_CPU`（见 `.env.example`）。默认关闭逐帧 mask 诊断日志，避免为日志额外复制和同步 GPU 数据；调试时可设置 `SAM_DEBUG_LOGGING=true`。CPU offload 会降低部分传播速度，但能减少显存占用。这些控制不能保证任意分辨率、任意目标数量都不会 OOM；大模型本身、当前帧和目标数量仍需容纳于显存。API 服务使用单个 worker；默认 GPU 池通过独立子进程管理各账户的模型，详见下文。
 
 更新后重启后端并刷新前端，前端源码部署需运行 `cd frontend && npm run build`。旧标注自动按访问迁移，无需批量转换。
 
@@ -163,3 +163,66 @@ SAM3.1 交互传播增加了缓存一致性适配：清理提示帧附近的普�
 ## SAM3.1 设备兼容与诊断
 
 多目标状态拆分、合并时，后端适配层会将 `mux/demux` 转换矩阵对齐到输入缓存的设备和数据类型，运算后恢复原矩阵，保留 CPU 转存缓存。分割失败会在后端记录完整 Traceback，并包含项目、视频、session、帧和目标编号，方便定位首次点击失败。此修复通过 CPU 回归测试，尚未在本机验证真实 CUDA 推理。
+
+## 多用户 GPU 池与按需释放
+
+真实 SAM 后端默认启用 GPU 池。Web 服务只处理账户、项目和标注，不加载 CUDA 模型；点击 **Start Session** 才创建独立推理子进程。每个账户最多保留一个 session，每张物理 GPU 同时最多运行一个本程序的推理进程。不同账户可在不同卡上并行推理；同一账户重复启动当前视频复用 session，显式启动其他视频替换自己的旧 session，不影响其他账户。浏览和切换视频不占用额外显卡。
+
+选卡通过 `nvidia-smi` 查询：排除已有计算进程的卡，默认还要求空闲显存至少 12000 MiB、已用显存不超过 512 MiB、利用率不超过 5%。按剩余显存从多到少分配，并使用进程内预留及主机文件锁避免重复分配。无法查询驱动时拒绝分配；没有可用卡时启动接口返回 HTTP 409，前端显示资源忙，当前版本不自动排队。MIG 分区不支持分配。
+
+```env
+SAM_GPU_POOL=true
+SAM_GPU_DEVICES=0,1,2,3
+SAM_GPU_MIN_FREE_MB=12000
+SAM_GPU_MAX_USED_MB=512
+SAM_GPU_MAX_UTILIZATION=5
+SAM_SESSION_IDLE_SECONDS=600
+SAM_WORKER_TIMEOUT_SECONDS=600
+SAM_GPU_LOCK_DIR=/tmp/video-seg-labeling-gpu-locks
+```
+
+`SAM_GPU_DEVICES` 使用物理 `nvidia-smi` 编号或完整 GPU UUID，留空表示可查询的全部显卡。每个子进程单独设置 `CUDA_VISIBLE_DEVICES`，内部统一使用 `cuda:0`；主服务原来的 `CUDA_VISIBLE_DEVICES=0` 不限制此白名单。显存阈值只是入场条件，不是显存用量上限，也不能保证任意视频和目标数量不会 OOM。
+
+顶部显示空闲卡数及 session 实际分配设备，并提供 **释放 GPU** 按钮。关闭 session 会结束整个子进程、释放模型权重及缓存；重置 session 只清空跟踪目标，不释放 GPU。默认无推理操作 10 分钟后自动回收（约每 15 秒检查一次），传播和初始化期间不回收；查询状态或浏览页面不延长租用。回收后重新启动 session、添加提示即可继续标注，已保存的数据不会删除。加载、推理失败或进程超时会释放对应 session；主服务正常退出时清理子进程，异常退出时子进程检测到父进程消失后退出。
+
+同一部署仍应使用一个 API worker。主机上的协作实例需使用同一锁目录；文件锁仅约束使用同一机制的程序。其他训练程序仍可能在检查后启动并竞争资源，若需要强制隔离，请使用专用 GPU 白名单或统一的集群调度器。池模式下管理员不能通过设备切换影响所有账户，模型切换也需先释放全部 session。`SAM_GPU_POOL=false` 可恢复旧的单进程方式，但不提供多用户 GPU 隔离及进程级显存释放。
+
+无需新增依赖。更新后重启后端、重新构建前端并创建新 session。调度、进程通信及资源回收已通过无 GPU 测试，真实 CUDA 多卡运行需在部署环境验证。
+
+### 管理员配置 GPU
+
+管理员登录后，点击顶部 **GPU 管理**，即可设置推理模型、GPU 池开关、显卡白名单、显存和利用率阈值、空闲自动释放时间及进程响应超时。无需修改 `.env` 或重启服务。页面显示所有可查询显卡的显存与利用率，以及各账户 session 的项目、设备和运行状态；普通账户不能查看此页，也不能调用配置或管理释放接口。
+
+配置原子保存于 `PROJECTS_DIR/.gpu-settings.json`，重启后优先于 `.env` 中对应的默认值。备份时一并保存该隐藏文件；主机锁目录等部署参数仍由环境变量指定。修改白名单只影响后续分配，空闲超时应用于现有 session。切换模型或 GPU 池模式前必须释放所有 session；旧单进程模式若已在主进程加载模型，需先重启后端才能切换模式。
+
+管理员可释放任意账户的空闲 session；正在加载或推理时，需明确确认 **强制释放**，该操作中止推理并结束其进程，已保存的标注保留，尚未保存的结果可能丢失。普通用户仍可申请 GPU 和释放自己的 session。
+
+## 后台启动、停止与日志
+
+在仓库根目录执行，默认使用已经构建的前端，由后端统一提供页面：
+
+```bash
+./start.sh                 # 后台启动，SSH 断开后继续运行
+./service.sh status         # 查看状态和访问地址
+./service.sh logs           # 查看并持续跟踪日志，Ctrl+C 只退出日志查看
+./service.sh restart        # 重启（会中断当前推理和未完成的导出）
+./stop.sh                   # 停止服务及其托管子进程
+```
+
+首次从旧 tmux/手动启动方式迁移时，先在任务结束后运行 `./stop.sh --legacy`，再运行 `./start.sh`。迁移命令仅匹配本仓库后端、前端工作目录及对应启动程序，不再按端口杀进程。无需关闭其他 tmux 会话。
+
+默认后台模式需要 `frontend/dist`，缺少时先执行 `(cd frontend && npm ci && npm run build)`；也可用 `./start.sh --dev` 后台运行前后端开发服务。`./start.sh --foreground` 保留前台运行方式。`.env`、端口与 Python 环境统一读取，支持在其他目录使用脚本的绝对路径。`PYTHON_BIN` 可指定自定义 Python。程序状态保存在 `.run/`，日志在 `logs/service.log`，均不进入 Git。
+
+无 systemd 时使用独立后台监护进程，后端或开发前端异常退出后间隔 5 秒重启；重复启动不会创建第二份实例。端口被占用时拒绝启动，不杀死占用者。停止会先发送终止信号，最长等待约 25 秒，再清理本服务进程组中的残余子进程。此模式支持 SSH 断开，不提供整机重启后的开机自启。
+
+在运行 systemd 的 Linux 主机上，可一次性安装为开机自启服务（将 `YOUR_LOGIN_USER` 替换为具有项目、数据和 GPU 访问权限的运行账户）：
+
+```bash
+./stop.sh
+sudo ./service.sh install-systemd --user YOUR_LOGIN_USER
+./start.sh
+```
+
+安装后同样使用 `./start.sh`、`./stop.sh`、`./service.sh restart/status/logs`，会自动转交 systemd；日志改由 journal 保存。安装命令只安装并启用开机启动，实际启动仍由 `./start.sh` 执行。systemd 模式只托管正式服务；开发时可分别运行 `./start_backend.sh` 和 `./start_frontend.sh`。没有运行 systemd 的容器环境直接使用默认后台模式，不必安装。
+
+后台 Web 服务不会因此常驻 GPU 模型；模型仍按管理员配置的 GPU 池策略按需加载与释放。

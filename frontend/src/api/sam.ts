@@ -155,3 +155,8 @@ interface DeviceSwitchResult {
   backend: string;
   fallback_error?: string | null;
 }
+
+export async function getGPUResources() {
+  const { data } = await api.get<{ pool: boolean; free: number; idle_seconds: number }>("/sam/resources");
+  return data;
+}
