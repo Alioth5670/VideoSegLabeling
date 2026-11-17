@@ -4,7 +4,18 @@ import { api } from "./client";
 
 export async function startSession(projectId: string, videoId?: string) {
   const { data } = await api.post(`/projects/${projectId}/sam/session`, {}, { params: videoId ? { video_id: videoId } : undefined });
-  return data as { session_id: string; backend: string; device: string; video_supported: boolean; multiplex_supported: boolean; fallback_error?: string | null };
+  return data as { session_id: string; object_ids: number[]; backend: string; device: string; video_supported: boolean; multiplex_supported: boolean; fallback_error?: string | null };
+}
+
+export async function getVideoSession(projectId: string, videoId?: string, signal?: AbortSignal) {
+  const { data } = await api.get<{ session: { session_id: string; object_ids: number[] } | null; backend: string; device: string }>(
+    `/projects/${projectId}/sam/session`, { params: videoId ? { video_id: videoId } : undefined, signal }
+  );
+  return data;
+}
+
+export async function closeSession(projectId: string, sessionId: string) {
+  await api.post(`/projects/${projectId}/sam/session/close`, { session_id: sessionId });
 }
 
 export async function resetSession(projectId: string, sessionId: string, videoId?: string) {
@@ -82,10 +93,10 @@ export async function propagate(
         options?.onFrame?.(event.frame);
       } else if (event.type === "done") {
         backend = event.backend;
-        frames.splice(0, frames.length, ...event.frames);
+        if (event.frames.length) frames.splice(0, frames.length, ...event.frames);
       } else if (event.type === "cancelled") {
         backend = event.backend;
-        frames.splice(0, frames.length, ...event.frames);
+        if (event.frames.length) frames.splice(0, frames.length, ...event.frames);
         return { backend, frames, cancelled: true };
       } else if (event.type === "error") {
         throw new Error(event.detail);
@@ -99,10 +110,10 @@ export async function propagate(
       options?.onFrame?.(event.frame);
     } else if (event.type === "done") {
       backend = event.backend;
-      frames.splice(0, frames.length, ...event.frames);
+      if (event.frames.length) frames.splice(0, frames.length, ...event.frames);
     } else if (event.type === "cancelled") {
       backend = event.backend;
-      frames.splice(0, frames.length, ...event.frames);
+      if (event.frames.length) frames.splice(0, frames.length, ...event.frames);
       return { backend, frames, cancelled: true };
     } else if (event.type === "error") {
       throw new Error(event.detail);

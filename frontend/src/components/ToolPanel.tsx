@@ -1,3 +1,4 @@
+import { isCurrentProject } from "../utils/project";
 import { Sparkles, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import axios from "axios";
@@ -17,6 +18,8 @@ export default function ToolPanel() {
   const boxRowRef = useRef<HTMLDivElement>(null);
   const pointRowRefs = useRef(new Map<number, HTMLDivElement>());
   const statusMessage = message || state.manualMessage;
+
+  useEffect(() => setMessage(""), [project?.projectId, project?.activeVideoId]);
 
   useEffect(() => {
     function onFocusPromptRow(event: Event) {
@@ -60,7 +63,9 @@ export default function ToolPanel() {
       const responseObjectIds = Object.keys(response.objects ?? {}).map(Number);
       sessionObjectIds.push(...responseObjectIds);
       resultObjectId = responseObjectIds[0];
+      if (!isCurrentProject(project.projectId, project.activeVideoId)) return;
       const fresh = await getProject(project.projectId, project.activeVideoId);
+      if (!isCurrentProject(project.projectId, project.activeVideoId)) return;
       const projectStore = useProjectStore.getState();
       projectStore.setObjects(Object.values(fresh.annotations.objects).map((obj: any) => ({
         objectId: obj.object_id,
@@ -75,14 +80,15 @@ export default function ToolPanel() {
         projectStore.setSelectedObjectId(resultObjectId);
       }
       invalidateFrameAnnotations(project.projectId, state.frameIndex, project.activeVideoId);
-      state.setAnnotatedFrames(Object.keys(fresh.annotations.frames).map(Number));
+      state.setAnnotatedFrames(fresh.annotations.annotated_frames ?? Object.keys(fresh.annotations.frames ?? {}).map(Number));
       state.addSessionObjectIds(sessionObjectIds);
       state.clearPrompts();
       state.refreshOverlay();
       const health = await getHealth();
       state.setBackend(health.sam_backend);
-      setMessage("Segmentation saved.");
+      if (isCurrentProject(project.projectId, project.activeVideoId)) setMessage("Segmentation saved.");
     } catch (error) {
+      if (!isCurrentProject(project.projectId, project.activeVideoId)) return;
       const health = await getHealth().catch(() => null);
       if (health) state.setBackend(health.sam_backend);
       setMessage(errorMessage(error));

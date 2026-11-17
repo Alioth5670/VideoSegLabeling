@@ -1,11 +1,20 @@
-import { Download, Repeat, Square } from "lucide-react";
+import { isCurrentProject } from "../utils/project";
+import { Repeat, Square } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { getProject } from "../api/project";
-import { exportProject } from "../api/export";
+import ExportPanel from "./ExportPanel";
 import { cancelPropagation, propagate } from "../api/sam";
 import { invalidateFrameAnnotations } from "../api/annotation";
 import { useAnnotationStore } from "../store/annotationStore";
 import { useProjectStore } from "../store/projectStore";
+
+interface PropagationRun {
+  projectId: string;
+  videoId?: string;
+  sessionId: string;
+  label: string;
+  controller: AbortController;
+}
 
 export default function PromptPanel() {
   const { project } = useProjectStore();
@@ -16,7 +25,9 @@ export default function PromptPanel() {
   const [propagating, setPropagating] = useState(false);
   const [propagationProgress, setPropagationProgress] = useState<{ frameIndex: number; completed: number; total: number } | null>(null);
   const [message, setMessage] = useState("");
-  const abortRef = useRef<AbortController | null>(null);
+  const activeRunRef = useRef<PropagationRun | null>(null);
+  const [activeRun, setActiveRun] = useState<PropagationRun | null>(null);
+  const [stopping, setStopping] = useState(false);
 
   useEffect(() => {
     if (!project) return;
@@ -24,78 +35,94 @@ export default function PromptPanel() {
     setEndFrame(project.frameCount > 0 ? project.frameCount - 1 : 0);
   }, [project?.projectId, project?.activeVideoId, project?.frameCount, state.frameIndex]);
 
+  useEffect(() => () => {
+    const run = activeRunRef.current;
+    if (run) {
+      void cancelPropagation(run.projectId, run.sessionId, run.videoId).catch(() => undefined);
+      run.controller.abort();
+    }
+  }, []);
+
   async function onPropagate() {
-    if (!project || !state.sessionId || state.sessionObjectIds.length === 0 || propagating) return;
+    if (!project || !state.sessionId || state.sessionObjectIds.length === 0 || activeRunRef.current) return;
     const start = direction === "backward" ? Math.max(startFrame, endFrame) : Math.min(startFrame, endFrame);
     const end = direction === "backward" ? Math.min(startFrame, endFrame) : Math.max(startFrame, endFrame);
-    const controller = new AbortController();
-    abortRef.current = controller;
+    const video = project.videos.find(item => item.videoId === project.activeVideoId);
+    const run: PropagationRun = { projectId: project.projectId, videoId: project.activeVideoId,
+      sessionId: state.sessionId, label: video?.name ?? project.name, controller: new AbortController() };
+    activeRunRef.current = run;
+    setActiveRun(run);
     const totalFrames = Math.abs(end - start) + 1;
+    const completedFrames = new Set<number>();
     setPropagating(true);
+    setStopping(false);
     setPropagationProgress({ frameIndex: start, completed: 0, total: totalFrames });
     setMessage("Propagating...");
     try {
-      const result = await propagate(project.projectId, {
-        session_id: state.sessionId,
-        object_ids: state.sessionObjectIds,
-        start_frame: start,
-        end_frame: end,
-        direction,
-        mode: "auto"
-      }, project.activeVideoId, {
-        signal: controller.signal,
+      const result = await propagate(run.projectId, {
+        session_id: run.sessionId, object_ids: [...state.sessionObjectIds],
+        start_frame: start, end_frame: end, direction, mode: "auto"
+      }, run.videoId, {
+        signal: run.controller.signal,
         onFrame: (frame) => {
+          if (activeRunRef.current !== run) return;
           const frameIndex = Number(frame.frame_index);
-          const annotationState = useAnnotationStore.getState();
-          invalidateFrameAnnotations(project.projectId, frameIndex, project.activeVideoId);
-          annotationState.addAnnotatedFrame(frameIndex);
-          setPropagationProgress((current) => ({
-            frameIndex,
-            completed: Math.min((current?.completed ?? 0) + 1, current?.total ?? totalFrames),
-            total: current?.total ?? totalFrames
-          }));
-          if (annotationState.frameIndex === frameIndex) {
-            annotationState.refreshOverlay();
+          completedFrames.add(frameIndex);
+          setPropagationProgress({ frameIndex, completed: Math.min(completedFrames.size, totalFrames), total: totalFrames });
+          invalidateFrameAnnotations(run.projectId, frameIndex, run.videoId);
+          if (isCurrentProject(run.projectId, run.videoId)) {
+            const annotationState = useAnnotationStore.getState();
+            annotationState.addAnnotatedFrame(frameIndex);
+            if (annotationState.frameIndex === frameIndex) annotationState.refreshOverlay();
           }
         }
       });
-      for (const frame of result.frames ?? []) {
-        invalidateFrameAnnotations(project.projectId, Number(frame.frame_index), project.activeVideoId);
+      if (isCurrentProject(run.projectId, run.videoId)) {
+        const fresh = await getProject(run.projectId, run.videoId);
+        if (isCurrentProject(run.projectId, run.videoId)) {
+          state.setAnnotatedFrames(fresh.annotations.annotated_frames ?? Object.keys(fresh.annotations.frames ?? {}).map(Number));
+          state.refreshOverlay();
+        }
       }
-      const fresh = await getProject(project.projectId, project.activeVideoId);
-      state.setAnnotatedFrames(Object.keys(fresh.annotations.frames).map(Number));
-      state.refreshOverlay();
       setMessage(result.cancelled ? "Propagation stopped." : "Propagation finished.");
     } catch (error) {
       if (isAbortError(error)) {
-        const fresh = await getProject(project.projectId, project.activeVideoId).catch(() => null);
-        if (fresh) {
-          state.setAnnotatedFrames(Object.keys(fresh.annotations.frames).map(Number));
-          state.refreshOverlay();
+        if (isCurrentProject(run.projectId, run.videoId)) {
+          const fresh = await getProject(run.projectId, run.videoId).catch(() => null);
+          if (fresh && isCurrentProject(run.projectId, run.videoId)) {
+            state.setAnnotatedFrames(fresh.annotations.annotated_frames ?? Object.keys(fresh.annotations.frames ?? {}).map(Number));
+            state.refreshOverlay();
+          }
         }
         setMessage("Propagation stopped.");
       } else {
         setMessage(error instanceof Error ? error.message : "Propagation failed.");
       }
     } finally {
-      abortRef.current = null;
-      setPropagating(false);
-      setPropagationProgress(null);
+      if (activeRunRef.current === run) {
+        activeRunRef.current = null;
+        setActiveRun(null);
+        setPropagating(false);
+        setStopping(false);
+        setPropagationProgress(null);
+      }
     }
   }
 
   async function onCancelPropagation() {
-    if (!project || !state.sessionId) return;
+    const run = activeRunRef.current;
+    if (!run || stopping) return;
+    setStopping(true);
     setMessage("Stopping propagation...");
-    await cancelPropagation(project.projectId, state.sessionId, project.activeVideoId).catch(() => undefined);
-    abortRef.current?.abort();
+    try {
+      const response = await cancelPropagation(run.projectId, run.sessionId, run.videoId);
+      if (!response.cancelled) run.controller.abort();
+    } catch {
+      // Disconnecting also cancels the server stream when the stop request fails.
+      run.controller.abort();
+    }
   }
 
-  async function onExport(format: string) {
-    if (!project) return;
-    const result = await exportProject(project.projectId, format);
-    window.open(result.download_url, "_blank");
-  }
 
   return (
     <section className="panel">
@@ -110,14 +137,15 @@ export default function PromptPanel() {
         <option value="bidirectional">bidirectional</option>
       </select>
       {propagating ? (
-        <button className="command danger" disabled={!project || !state.sessionId} onClick={onCancelPropagation}>
-          <Square size={18} /> Stop Propagation
+        <button className="command danger" disabled={stopping} onClick={onCancelPropagation}>
+          <Square size={18} /> {stopping ? "Stopping..." : "Stop Propagation"}
         </button>
       ) : (
         <button className="command" disabled={!project || !state.sessionId || state.sessionObjectIds.length === 0} onClick={onPropagate}>
           <Repeat size={18} /> Propagate {state.sessionObjectIds.length > 0 ? `(${state.sessionObjectIds.length})` : ""}
         </button>
       )}
+      {activeRun && <span className="status-line" title={activeRun.label}>正在传播：{activeRun.label}</span>}
       {propagating && propagationProgress && (
         <div className="propagation-progress">
           <div className="propagation-progress-head">
@@ -133,24 +161,7 @@ export default function PromptPanel() {
           ? `${state.sessionObjectIds.length} current-session object${state.sessionObjectIds.length === 1 ? "" : "s"} can propagate`
           : "Start a SAM session, then segment objects before propagating"}
       </span>
-      <div className={`export-select ${project ? "" : "disabled"}`}>
-        <Download size={18} />
-        <select
-          disabled={!project}
-          value=""
-          onChange={(event) => {
-            const format = event.target.value;
-            if (!format) return;
-            onExport(format);
-          }}
-        >
-          <option value="">Export annotations</option>
-          <option value="project_json">Project JSON</option>
-          <option value="mask_png">Mask PNG</option>
-          <option value="coco_video_json">COCO JSON</option>
-          <option value="all_videos_zip">All Videos ZIP</option>
-        </select>
-      </div>
+      <ExportPanel />
     </section>
   );
 }

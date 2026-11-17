@@ -1,43 +1,26 @@
+import axios from "axios";
+import { normalizeProject, applyProjectPayload, defaultProjectName } from "../utils/project";
 import { FolderPlus, Search, Upload } from "lucide-react";
-import { activateVideo, createProject, getProject, listProjects, uploadVideo, uploadVideoFolder } from "../api/project";
+import { activateVideo, createProject, getProject, listProjects, uploadVideo, uploadVideoFolder, type ProjectSummary } from "../api/project";
 import { useProjectStore } from "../store/projectStore";
 import { useAnnotationStore } from "../store/annotationStore";
 import type { ProjectInfo } from "../types/project";
 import { useEffect, useMemo, useState } from "react";
 
-function normalizeProject(data: any) {
-  const videos = (data.videos ?? []).map((video: any) => ({
-    videoId: video.video_id,
-    name: video.name ?? "video",
-    relativePath: video.relative_path,
-    fps: video.fps ?? 0,
-    width: video.width ?? 0,
-    height: video.height ?? 0,
-    frameCount: video.frame_count ?? 0,
-    duration: video.duration ?? 0
-  }));
-  return {
-    projectId: data.project_id,
-    name: data.name ?? "Untitled",
-    videos,
-    activeVideoId: data.active_video_id ?? videos[0]?.videoId,
-    paths: data.paths ?? {},
-    fps: data.fps ?? 0,
-    width: data.width ?? 0,
-    height: data.height ?? 0,
-    frameCount: data.frame_count ?? 0,
-    duration: data.duration ?? 0
-  };
-}
 
 export default function ProjectPanel() {
   const { project, setProject, setObjects } = useProjectStore();
   const { setAnnotatedFrames, setFrameIndex } = useAnnotationStore();
-  const [projects, setProjects] = useState<Array<{ project_id: string; name: string }>>([]);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projectFilter, setProjectFilter] = useState("");
+  const [projectOffset, setProjectOffset] = useState(0);
+  const [projectTotal, setProjectTotal] = useState(0);
+  const [projectRevision, setProjectRevision] = useState(0);
   const [showCreate, setShowCreate] = useState(false);
-  const [newProjectName, setNewProjectName] = useState("demo");
+  const [newProjectName, setNewProjectName] = useState(defaultProjectName);
   const [projectRoot, setProjectRoot] = useState(() => localStorage.getItem("projectRoot") ?? "");
-  const [projectFolder, setProjectFolder] = useState("demo");
+  const [projectFolder, setProjectFolder] = useState(() => safeFolderName(newProjectName));
+  const [creating, setCreating] = useState(false);
   const [createMessage, setCreateMessage] = useState("");
   const [videoFilter, setVideoFilter] = useState("");
   const [uploadProgress, setUploadProgress] = useState<{ completed: number; total: number } | null>(null);
@@ -51,7 +34,19 @@ export default function ProjectPanel() {
   }, [project?.videos, videoFilter]);
 
   useEffect(() => {
-    listProjects().then((data) => setProjects(data.projects)).catch(() => setProjects([]));
+    let active = true;
+    const timer = window.setTimeout(() => {
+      listProjects(projectFilter, projectOffset).then(data => {
+        if (active) { setProjects(data.projects); setProjectTotal(data.total); }
+      }).catch(() => { if (active) setCreateMessage("项目列表加载失败"); });
+    }, 200);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [projectFilter, projectOffset, projectRevision]);
+
+  useEffect(() => {
+    const refresh = () => setProjectRevision(value => value + 1);
+    window.addEventListener("projects-changed", refresh);
+    return () => window.removeEventListener("projects-changed", refresh);
   }, []);
 
   async function openProject(projectId: string) {
@@ -66,26 +61,15 @@ export default function ProjectPanel() {
     applyProjectPayload(data);
   }
 
-  function applyProjectPayload(data: any) {
-    setProject(normalizeProject(data.project));
-    setObjects(Object.values(data.annotations?.objects ?? {}).map((obj: any) => ({
-      objectId: obj.object_id,
-      trackId: obj.track_id,
-      category: obj.category,
-      color: obj.color,
-      visible: obj.visible,
-      locked: obj.locked,
-      createdFrame: obj.created_frame
-    })));
-    setAnnotatedFrames(Object.keys(data.annotations?.frames ?? {}).map(Number));
-    setFrameIndex(0);
-  }
 
   async function onCreate() {
-    const name = newProjectName.trim() || "demo";
+    if (creating) return;
+    const name = newProjectName.trim();
+    if (!name) { setCreateMessage("请输入项目名称"); return; }
     const root = projectRoot.trim();
     const folder = projectFolder.trim() || safeFolderName(name);
     const projectDir = root ? joinPath(root, folder) : undefined;
+    setCreating(true);
     setCreateMessage("Creating project...");
     try {
       const created = await createProject(name, projectDir);
@@ -93,11 +77,16 @@ export default function ProjectPanel() {
       setProject(normalizeProject(created));
       setObjects([]);
       setAnnotatedFrames([]);
-      setProjects((current) => [{ project_id: created.project_id, name: created.name }, ...current]);
+      setProjectOffset(0);
+      setProjectFilter("");
+      setProjectRevision(value => value + 1);
       setShowCreate(false);
       setCreateMessage("");
     } catch (error) {
-      setCreateMessage(error instanceof Error ? error.message : "Failed to create project.");
+      const detail = axios.isAxiosError(error) ? error.response?.data?.detail : undefined;
+      setCreateMessage(typeof detail === "string" ? detail : error instanceof Error ? error.message : "Failed to create project.");
+    } finally {
+      setCreating(false);
     }
   }
 
@@ -141,7 +130,15 @@ export default function ProjectPanel() {
   return (
     <section className="panel">
       <div className="panel-title">Project</div>
-      <button className="command" onClick={() => setShowCreate((value) => !value)} title="Create project">
+      <button className="command" disabled={creating} onClick={() => {
+        if (!showCreate) {
+          const name = defaultProjectName();
+          setNewProjectName(name);
+          setProjectFolder(safeFolderName(name));
+          setCreateMessage("");
+        }
+        setShowCreate(!showCreate);
+      }} title="Create project">
         <FolderPlus size={18} /> New
       </button>
       {showCreate && (
@@ -150,10 +147,11 @@ export default function ProjectPanel() {
             <span>Name</span>
             <input
               className="text-input"
+              maxLength={120}
               value={newProjectName}
               onChange={(event) => {
                 setNewProjectName(event.target.value);
-                setProjectFolder(safeFolderName(event.target.value || "demo"));
+                setProjectFolder(safeFolderName(event.target.value));
               }}
             />
           </label>
@@ -170,20 +168,27 @@ export default function ProjectPanel() {
             <span>Folder</span>
             <input className="text-input" value={projectFolder} onChange={(event) => setProjectFolder(event.target.value)} />
           </label>
-          <div className="path-preview" title={projectRoot ? joinPath(projectRoot, projectFolder || safeFolderName(newProjectName || "demo")) : "Default projects folder"}>
-            {projectRoot ? joinPath(projectRoot, projectFolder || safeFolderName(newProjectName || "demo")) : "Default projects folder"}
+          <div className="path-preview" title={projectRoot ? joinPath(projectRoot, projectFolder || safeFolderName(newProjectName)) : "Default projects folder"}>
+            {projectRoot ? joinPath(projectRoot, projectFolder || safeFolderName(newProjectName)) : "Default projects folder"}
           </div>
           <div className="create-actions">
-            <button className="primary" onClick={onCreate}>Create</button>
+            <button className="primary" disabled={creating || !newProjectName.trim()} onClick={onCreate}>{creating ? "Creating..." : "Create"}</button>
             <button className="command" onClick={() => setShowCreate(false)}>Cancel</button>
           </div>
           {createMessage && <span className="status-line">{createMessage}</span>}
         </div>
       )}
+      <input className="text-input" placeholder="搜索我的项目" value={projectFilter} onChange={e => { setProjectFilter(e.target.value); setProjectOffset(0); }} />
       <select className="text-input" value={project?.projectId ?? ""} onChange={(e) => openProject(e.target.value)}>
         <option value="">Open project</option>
-        {projects.map((item) => <option value={item.project_id} key={item.project_id}>{item.name}</option>)}
+        {project && !projects.some(item => item.project_id === project.projectId) && <option value={project.projectId}>{project.name}</option>}
+        {projects.map((item) => <option value={item.project_id} key={item.project_id} disabled={item.data_status === "missing"}>{item.name}{item.data_status === "missing" ? "（文件缺失）" : ""}</option>)}
       </select>
+      <div className="project-pagination">
+        <button className="command" disabled={projectOffset === 0} onClick={() => setProjectOffset(value => Math.max(0, value - 50))}>上一页</button>
+        <span>{projectTotal} 个项目</span>
+        <button className="command" disabled={projectOffset + 50 >= projectTotal} onClick={() => setProjectOffset(value => value + 50)}>下一页</button>
+      </div>
       <div className="upload-actions">
         <label className={`command ${project && !uploadProgress ? "" : "disabled"}`} title="Upload video">
           <Upload size={18} /> Upload
@@ -268,7 +273,7 @@ export default function ProjectPanel() {
 }
 
 function safeFolderName(value: string) {
-  return (value.trim() || "demo").replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "_").slice(0, 80);
+  return (value.trim() || "project").replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "_").slice(0, 80);
 }
 
 function joinPath(root: string, folder: string) {

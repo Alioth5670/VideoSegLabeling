@@ -1,12 +1,15 @@
 import json
 import shutil
 import uuid
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import cv2
 from fastapi import UploadFile
 
+from app.services.account_store import AccountStore
 from app.utils.project_registry import load_project_paths, project_root, register_project_dir
 
 
@@ -16,6 +19,7 @@ VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".w
 class VideoService:
     def __init__(self, projects_dir: Path):
         self.projects_dir = projects_dir
+        self.account_store = AccountStore(projects_dir / ".accounts.sqlite3")
 
     def create_project(self, name: str, project_dir: str | None = None) -> dict:
         project_id = uuid.uuid4().hex[:12]
@@ -40,7 +44,7 @@ class VideoService:
             "created_at": now,
             "updated_at": now,
         }
-        self.save_project(project_id, project)
+        self.save_project(project_id, project, update_index=False)
         return self._with_paths(project)
 
     def list_projects(self) -> list[dict]:
@@ -63,6 +67,19 @@ class VideoService:
                 projects.append(self._with_paths(json.loads(project_file.read_text(encoding="utf-8"))))
         return projects
 
+    def project_availability(self, project_ids: list[str]) -> dict[str, dict]:
+        # Inspect only the requested page, without parsing full project metadata.
+        paths = load_project_paths(self.projects_dir)
+        availability = {}
+        for project_id in project_ids:
+            root = Path(paths.get(project_id, self.projects_dir / project_id))
+            if (root / 'project.json').is_file():
+                availability[project_id] = {'data_status': 'available', 'missing_reason': None}
+            else:
+                reason = '项目目录不存在' if not root.is_dir() else 'project.json 不存在'
+                availability[project_id] = {'data_status': 'missing', 'missing_reason': reason}
+        return availability
+
     def project_path(self, project_id: str) -> Path:
         return project_root(self.projects_dir, project_id)
 
@@ -75,13 +92,33 @@ class VideoService:
             raise FileNotFoundError(project_id)
         return self._with_paths(json.loads(path.read_text(encoding="utf-8")))
 
-    def save_project(self, project_id: str, project: dict) -> None:
+    def save_project(self, project_id: str, project: dict, *, update_index: bool = True) -> None:
         saved = {**project}
         saved.pop("paths", None)
         saved.setdefault("videos", [])
         saved.setdefault("active_video_id", None)
         saved["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self.project_json_path(project_id).write_text(json.dumps(saved, indent=2, ensure_ascii=False), encoding="utf-8")
+        def write_metadata() -> None:
+            path = self.project_json_path(project_id)
+            descriptor, temporary = tempfile.mkstemp(prefix='.project-', suffix='.json', dir=path.parent)
+            try:
+                with os.fdopen(descriptor, 'w', encoding='utf-8') as out:
+                    json.dump(saved, out, indent=2, ensure_ascii=False)
+                os.replace(temporary, path)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+
+        if update_index:
+            with self.account_store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                row = db.execute('SELECT name FROM projects WHERE id=?', (project_id,)).fetchone()
+                if row:
+                    # A completed upload must not undo a concurrent management rename.
+                    saved['name'] = row['name']
+                write_metadata()
+                db.execute('UPDATE projects SET updated_at=? WHERE id=?', (saved['updated_at'], project_id))
+        else:
+            write_metadata()
 
     async def save_upload_and_decode(self, project_id: str, upload: UploadFile, relative_path: str | None = None) -> dict:
         return await self._save_upload_and_decode(project_id, upload, relative_path)
@@ -203,9 +240,10 @@ class VideoService:
         video = next((item for item in project.get("videos", []) if item.get("video_id") == video_id), None)
         if video is None:
             raise KeyError(video_id)
-        project["active_video_id"] = video_id
-        self._apply_active_video(project, video)
-        self.save_project(project_id, project)
+        if project.get("active_video_id") != video_id:
+            project["active_video_id"] = video_id
+            self._apply_active_video(project, video)
+            self.save_project(project_id, project)
         return self._with_paths(project)
 
     def _with_paths(self, project: dict) -> dict:

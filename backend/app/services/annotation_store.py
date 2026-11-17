@@ -2,6 +2,10 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from functools import wraps
+from threading import RLock
+
+from app.services import annotation_database as database
 
 from app.utils.color import color_for_object
 from app.utils.project_registry import project_root
@@ -12,13 +16,24 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def serialized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 class AnnotationStore:
     def __init__(self, projects_dir: Path):
         self.projects_dir = projects_dir
+        self._lock = RLock()
 
+    @serialized
     def project_dir(self, project_id: str) -> Path:
         return project_root(self.projects_dir, project_id)
 
+    @serialized
     def annotations_path(self, project_id: str, video_id: str | None = None) -> Path:
         if video_id:
             return video_dir(self.projects_dir, project_id, video_id) / "annotations.json"
@@ -27,81 +42,102 @@ class AnnotationStore:
             return video_dir(self.projects_dir, project_id, active_video_id) / "annotations.json"
         return self.project_dir(project_id) / "annotations.json"
 
+    @serialized
     def init_annotations(self, project_id: str, video_id: str | None = None) -> dict[str, Any]:
         data = self._default_annotations(project_id, video_id)
         self.save(project_id, data, video_id)
         return data
 
+    @serialized
     def load(self, project_id: str, video_id: str | None = None) -> dict[str, Any]:
-        path = self.annotations_path(project_id, video_id)
-        if not path.exists():
-            return self.init_annotations(project_id, video_id)
-        return self._normalize(json.loads(path.read_text(encoding="utf-8")), project_id, video_id)
+        with self._database(project_id, video_id) as db:
+            return self._normalize(database.snapshot(db), project_id, video_id)
 
+    @serialized
     def save(self, project_id: str, data: dict[str, Any], video_id: str | None = None) -> None:
-        path = self.annotations_path(project_id, video_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        with self._database(project_id, video_id) as db:
+            database.replace(db, data)
 
+    @serialized
+    def _database(self, project_id: str, video_id: str | None = None):
+        return database.connect(self.annotations_path(project_id, video_id), self._default_annotations(project_id, video_id))
+
+    @serialized
+    def object_records(self, project_id: str, video_id: str | None = None) -> dict[str, Any]:
+        with self._database(project_id, video_id) as db:
+            return {str(k): json.loads(v) for k, v in db.execute('SELECT id,data FROM objects ORDER BY id')}
+
+    @serialized
+    def summary(self, project_id: str, video_id: str | None = None) -> dict[str, Any]:
+        with self._database(project_id, video_id) as db:
+            return {'objects': {str(k): json.loads(v) for k, v in db.execute('SELECT id,data FROM objects ORDER BY id')},
+                    'annotated_frames': [f for (f,) in db.execute('SELECT DISTINCT frame FROM frames ORDER BY frame')]}
+
+    @serialized
+    def revision(self, project_id: str, video_id: str | None = None) -> tuple[int, int]:
+        with self._database(project_id, video_id):
+            pass
+        stat = self.annotations_path(project_id, video_id).with_suffix('.sqlite3').stat()
+        return stat.st_mtime_ns, stat.st_size
+
+    @serialized
     def next_object_id(self, data: dict[str, Any]) -> int:
         ids = [int(k) for k in data.get("objects", {}).keys()]
         return max(ids, default=0) + 1
 
+    @serialized
     def ensure_object(self, project_id: str, object_id: int | None, category: str | None, frame_index: int = 0, video_id: str | None = None) -> dict[str, Any]:
-        data = self.load(project_id, video_id)
-        if object_id is None:
-            object_id = self.next_object_id(data)
-        key = str(object_id)
-        objects = data.setdefault("objects", {})
-        if key not in objects:
-            color = color_for_object(object_id)
-            objects[key] = {
-                "object_id": object_id,
-                "track_id": object_id,
-                "category": category or f"object {object_id}",
-                "color": list(color),
-                "visible": True,
-                "locked": False,
-                "created_frame": frame_index,
-            }
-        elif category:
-            objects[key]["category"] = category
-        self.save(project_id, data, video_id)
-        return objects[key]
+        with self._database(project_id, video_id) as db:
+            db.execute('BEGIN IMMEDIATE')
+            if object_id is None:
+                object_id = db.execute('SELECT COALESCE(MAX(id),0)+1 FROM objects').fetchone()[0]
+            row = db.execute('SELECT data FROM objects WHERE id=?', (object_id,)).fetchone()
+            obj = json.loads(row[0]) if row else {
+                'object_id': object_id, 'track_id': object_id,
+                'category': category or f'object {object_id}', 'color': color_for_object(object_id),
+                'visible': True, 'locked': False, 'created_frame': frame_index}
+            if category:
+                obj['category'] = category
+            db.execute('INSERT OR REPLACE INTO objects VALUES (?,?)', (object_id, database.dump(obj)))
+            return obj
 
+    @serialized
     def add_prompt(self, project_id: str, prompt: dict[str, Any], video_id: str | None = None) -> None:
-        data = self.load(project_id, video_id)
-        data.setdefault("prompts", []).append(prompt)
-        self.save(project_id, data, video_id)
+        with self._database(project_id, video_id) as db:
+            db.execute('INSERT INTO prompts(data) VALUES (?)', (database.dump(prompt),))
 
+    @serialized
     def save_frame_object(self, project_id: str, frame_index: int, annotation: dict[str, Any], is_keyframe: bool, video_id: str | None = None) -> None:
-        data = self.load(project_id, video_id)
-        frame = data.setdefault("frames", {}).setdefault(str(frame_index), {"objects": {}})
-        existing = frame.get("objects", {}).get(str(annotation["object_id"]))
-        if existing and "locked" not in annotation:
-            annotation["locked"] = bool(existing.get("locked", False))
-        frame["objects"][str(annotation["object_id"])] = annotation
-        if is_keyframe:
-            pair = {"frame_index": frame_index, "object_id": annotation["object_id"]}
-            keyframes = data.setdefault("keyframes", [])
-            if pair not in keyframes:
-                keyframes.append(pair)
-        self.save(project_id, data, video_id)
+        self.save_frame_objects(project_id, frame_index, [annotation], is_keyframe, video_id)
 
+    @serialized
+    def save_frame_objects(self, project_id: str, frame_index: int, annotations: list[dict[str, Any]], is_keyframe: bool, video_id: str | None = None) -> None:
+        with self._database(project_id, video_id) as db:
+            db.execute('BEGIN IMMEDIATE')
+            for annotation in annotations:
+                object_id = int(annotation['object_id'])
+                row = db.execute('SELECT data FROM frames WHERE frame=? AND object_id=?', (frame_index, object_id)).fetchone()
+                saved = dict(annotation)
+                if row and 'locked' not in saved:
+                    saved['locked'] = bool(json.loads(row[0]).get('locked', False))
+                db.execute('INSERT OR REPLACE INTO frames VALUES (?,?,?)', (frame_index, object_id, database.dump(saved)))
+                if is_keyframe:
+                    db.execute('INSERT OR IGNORE INTO keyframes VALUES (?,?)', (frame_index, object_id))
+
+    @serialized
     def update_frame_object(self, project_id: str, frame_index: int, object_id: int, patch: dict[str, Any], video_id: str | None = None) -> dict[str, Any]:
-        data = self.load(project_id, video_id)
-        frame_key = str(frame_index)
-        object_key = str(object_id)
-        frame = data.get("frames", {}).get(frame_key)
-        if not frame or object_key not in frame.get("objects", {}):
-            raise KeyError((frame_index, object_id))
-        annotation = frame["objects"][object_key]
-        for field in ["locked"]:
-            if patch.get(field) is not None:
-                annotation[field] = patch[field]
-        self.save(project_id, data, video_id)
-        return annotation
+        with self._database(project_id, video_id) as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT data FROM frames WHERE frame=? AND object_id=?', (frame_index, object_id)).fetchone()
+            if not row:
+                raise KeyError((frame_index, object_id))
+            obj = json.loads(row[0])
+            if patch.get('locked') is not None:
+                obj['locked'] = patch['locked']
+            db.execute('UPDATE frames SET data=? WHERE frame=? AND object_id=?', (database.dump(obj), frame_index, object_id))
+            return obj
 
+    @serialized
     def delete_frame_object(self, project_id: str, frame_index: int, object_id: int, video_id: str | None = None) -> bool:
         data = self.load(project_id, video_id)
         frame_key = str(frame_index)
@@ -121,6 +157,7 @@ class AnnotationStore:
         self._delete_mask_file(project_id, annotation)
         return True
 
+    @serialized
     def delete_object_if_unreferenced(self, project_id: str, object_id: int, video_id: str | None = None) -> bool:
         data = self.load(project_id, video_id)
         key = str(object_id)
@@ -135,6 +172,7 @@ class AnnotationStore:
         self.save(project_id, data, video_id)
         return True
 
+    @serialized
     def batch_delete(
         self,
         project_id: str,
@@ -217,22 +255,27 @@ class AnnotationStore:
             "affected_frames": sorted(affected_frames),
         }
 
+    @serialized
     def frame_annotations(self, project_id: str, frame_index: int, video_id: str | None = None) -> dict[str, Any]:
-        data = self.load(project_id, video_id)
-        return {"frame_index": frame_index, "objects": data.get("frames", {}).get(str(frame_index), {"objects": {}})["objects"]}
+        with self._database(project_id, video_id) as db:
+            objects = {str(k): json.loads(v) for k, v in db.execute('SELECT object_id,data FROM frames WHERE frame=?', (frame_index,))}
+        return {'frame_index': frame_index, 'objects': objects}
 
+    @serialized
     def update_object(self, project_id: str, object_id: int, patch: dict[str, Any], video_id: str | None = None) -> dict[str, Any]:
-        data = self.load(project_id, video_id)
-        key = str(object_id)
-        objects = data.setdefault("objects", {})
-        if key not in objects:
-            raise KeyError(object_id)
-        for field in ["category", "visible", "locked", "color"]:
-            if patch.get(field) is not None:
-                objects[key][field] = patch[field]
-        self.save(project_id, data, video_id)
-        return objects[key]
+        with self._database(project_id, video_id) as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT data FROM objects WHERE id=?', (object_id,)).fetchone()
+            if not row:
+                raise KeyError(object_id)
+            obj = json.loads(row[0])
+            for field in ['category', 'visible', 'locked', 'color']:
+                if patch.get(field) is not None:
+                    obj[field] = patch[field]
+            db.execute('UPDATE objects SET data=? WHERE id=?', (database.dump(obj), object_id))
+            return obj
 
+    @serialized
     def delete_object(self, project_id: str, object_id: int, video_id: str | None = None) -> None:
         data = self.load(project_id, video_id)
         key = str(object_id)
@@ -253,20 +296,22 @@ class AnnotationStore:
         for annotation in deleted_annotations:
             self._delete_mask_file(project_id, annotation)
 
+    @serialized
     def nearest_object_mask(self, project_id: str, object_id: int, start_frame: int, video_id: str | None = None) -> tuple[int, dict[str, Any]] | None:
-        data = self.load(project_id, video_id)
-        candidates: list[tuple[int, dict[str, Any]]] = []
-        for frame_key, frame in data.get("frames", {}).items():
-            obj = frame.get("objects", {}).get(str(object_id))
-            if obj:
-                candidates.append((int(frame_key), obj))
-        if not candidates:
-            return None
-        return min(candidates, key=lambda item: abs(item[0] - start_frame))
+        with self._database(project_id, video_id) as db:
+            before = db.execute('SELECT frame,data FROM frames WHERE object_id=? AND frame<=? ORDER BY frame DESC LIMIT 1', (object_id, start_frame)).fetchone()
+            after = db.execute('SELECT frame,data FROM frames WHERE object_id=? AND frame>? ORDER BY frame LIMIT 1', (object_id, start_frame)).fetchone()
+            rows = [r for r in (before, after) if r]
+            if not rows:
+                return None
+            frame, value = min(rows, key=lambda r: abs(r[0] - start_frame))
+            return frame, json.loads(value)
 
+    @serialized
     def _default_annotations(self, project_id: str, video_id: str | None = None) -> dict[str, Any]:
         return {"project_id": project_id, "video_id": video_id, "objects": {}, "frames": {}, "prompts": [], "keyframes": []}
 
+    @serialized
     def _normalize(self, data: dict[str, Any], project_id: str, video_id: str | None = None) -> dict[str, Any]:
         normalized = self._default_annotations(project_id, video_id)
         if isinstance(data, dict):
@@ -286,6 +331,7 @@ class AnnotationStore:
             normalized["keyframes"] = []
         return normalized
 
+    @serialized
     def _active_video_id(self, project_id: str) -> str | None:
         project_file = self.project_dir(project_id) / "project.json"
         if not project_file.exists():
@@ -293,6 +339,7 @@ class AnnotationStore:
         project = json.loads(project_file.read_text(encoding="utf-8"))
         return project.get("active_video_id")
 
+    @serialized
     def _drop_unreferenced_objects(self, data: dict[str, Any]) -> list[int]:
         referenced: set[str] = set()
         for frame in data.get("frames", {}).values():
@@ -312,6 +359,7 @@ class AnnotationStore:
             data["prompts"] = [p for p in data.get("prompts", []) if self._optional_int(p.get("object_id")) not in deleted_set]
         return deleted
 
+    @serialized
     def _optional_int(self, value: Any) -> int | None:
         if value is None:
             return None
@@ -320,6 +368,7 @@ class AnnotationStore:
         except (TypeError, ValueError):
             return None
 
+    @serialized
     def _delete_mask_file(self, project_id: str, annotation: dict[str, Any] | None) -> None:
         if not annotation:
             return

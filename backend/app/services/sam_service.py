@@ -3,7 +3,9 @@ import time
 import uuid
 import inspect
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
+from functools import wraps
+from threading import RLock
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +14,32 @@ import numpy as np
 
 from app.config import Settings
 from app.services.annotation_store import AnnotationStore
+from app.services.frame_loader import LazyFrameLoader, lazy_frame_source
+from app.services.sam_state import preserve_prompt_cache, align_multiplex_devices
 from app.utils.mask import area_from_mask, bbox_from_mask, read_mask_png
+
+
+def exclusive_inference(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if not self._inference_lock.acquire(blocking=False):
+            raise RuntimeError("SAM is busy with another inference operation; retry when it finishes.")
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            if 'out of memory' in str(exc).lower() and self._active_backend != 'mock':
+                self._close_real_sessions()
+                self._sessions.clear()
+                raise RuntimeError('CUDA out of memory. The inference session was released; start a new session and use fewer objects or a shorter propagation range.') from None
+            raise
+        finally:
+            self._inference_lock.release()
+    return wrapped
 
 
 class SAMService:
     def __init__(self, config: Settings, store: AnnotationStore):
+        self._inference_lock = RLock()
         self.config = config
         self.store = store
         self._model: Any | None = None
@@ -25,6 +48,7 @@ class SAMService:
         self._active_device = self._normalize_device(config.sam_device)
         self._fallback_error: str | None = None
 
+    @exclusive_inference
     def load_model(self) -> None:
         if self._active_backend == "mock" or self._model is not None:
             return
@@ -56,6 +80,7 @@ class SAMService:
                         async_loading_frames=False,
                     )
                 self._active_backend = backend
+                self._configure_state_offload()
                 self._configure_interactive_video_tracking()
                 self._fallback_error = None
                 return
@@ -95,6 +120,7 @@ class SAMService:
         except Exception as exc:
             return [{"id": self._active_device, "label": f"{self._active_device} ({exc})", "available": False}]
 
+    @exclusive_inference
     def set_device(self, device: str) -> str:
         normalized = self._normalize_device(device)
         self._validate_device(normalized)
@@ -106,6 +132,7 @@ class SAMService:
             self._fallback_error = None
         return self._active_device
 
+    @exclusive_inference
     def set_backend(self, backend: str) -> str:
         allowed = {"mock", "sam3_video", "sam3_multiplex_video"}
         if backend not in allowed:
@@ -124,26 +151,35 @@ class SAMService:
     def is_multiplex_supported(self) -> bool:
         return self._active_backend == "sam3_multiplex_video"
 
-    def start_video_session(self, project_id: str, video_path: str, frames_dir: str) -> str:
-        session_id = uuid.uuid4().hex
-        if self._active_backend == "mock":
-            self._sessions[session_id] = {"project_id": project_id, "frames_dir": frames_dir}
-            return session_id
-        self.load_model()
-        if self._active_backend == "mock":
-            self._sessions[session_id] = {"project_id": project_id, "frames_dir": frames_dir}
-            return session_id
-        try:
-            self._close_real_sessions()
-            return self._start_real_session(frames_dir)
-        except Exception as exc:
-            self._active_backend = "mock"
-            self._model = None
-            self._fallback_error = self._format_fallback_error("real SAM session failed", str(exc))
-            print(f"Warning: {self._fallback_error}")
-            self._sessions[session_id] = {"project_id": project_id, "frames_dir": frames_dir, "fallback_error": self._fallback_error}
-            return session_id
+    def find_video_session(self, project_id: str, frames_dir: str) -> dict | None:
+        for session_id, session in list(self._sessions.items()):
+            if session['project_id'] == project_id and session['frames_dir'] == frames_dir:
+                resident = session_id in getattr(self._model, '_all_inference_states', {})
+                if self._active_backend == 'mock' or resident:
+                    return {'session_id': session_id, 'object_ids': list(session.get('object_ids', []))}
+        return None
 
+    def check_video_session(self, project_id: str, session_id: str, frames_dir: str) -> None:
+        self._check_project_session(project_id, session_id)
+        if self._sessions[session_id]['frames_dir'] != frames_dir:
+            raise ValueError('Session does not belong to this video')
+
+    @exclusive_inference
+    def start_video_session(self, project_id: str, video_path: str, frames_dir: str) -> str:
+        existing = self.find_video_session(project_id, frames_dir)
+        if existing:
+            return existing['session_id']
+        # Browsing another video does not touch the live session. Starting a new
+        # one explicitly releases it, keeping only one video resident in memory.
+        self._close_real_sessions()
+        self._sessions.clear()
+        if self._active_backend != 'mock':
+            self.load_model()
+        session_id = uuid.uuid4().hex if self._active_backend == 'mock' else self._start_real_session(frames_dir)
+        self._sessions[session_id] = {'project_id': project_id, 'frames_dir': frames_dir, 'object_ids': []}
+        return session_id
+
+    @exclusive_inference
     def segment_frame(
         self,
         project_id: str,
@@ -157,14 +193,27 @@ class SAMService:
         mask: np.ndarray | None = None,
         category: str | None = None,
     ) -> list[dict]:
-        if self._active_backend != "mock":
-            return self._real_segment(frame_index, image_path, session_id, object_id, text, box, points or [])
-        return self._mock_segment(project_id, frame_index, image_path, object_id, text, box, points or [], mask, category)
+        self._check_project_session(project_id, session_id)
+        if self._active_backend != 'mock':
+            if not session_id:
+                raise RuntimeError('Start a video session before segmenting')
+            results = self._real_segment(frame_index, image_path, session_id, object_id, text, box, points or [])
+        else:
+            results = self._mock_segment(project_id, frame_index, image_path, object_id, text, box, points or [], mask, category)
+        if session_id:
+            record = self._sessions[session_id]
+            record['object_ids'] = sorted(set(record.get('object_ids', [])) | {int(result['object_id']) for result in results})
+        return results
+
+    def _check_project_session(self, project_id: str, session_id: str | None) -> None:
+        if session_id and self._sessions.get(session_id, {}).get("project_id") != project_id:
+            raise ValueError("Session does not belong to this project")
 
     def add_prompt(self, *args: Any, **kwargs: Any) -> dict:
         results = self.segment_frame(*args, **kwargs)
         return {"objects": results}
 
+    @exclusive_inference
     def propagate_in_video(
         self,
         project_id: str,
@@ -177,11 +226,11 @@ class SAMService:
         on_frame: Callable[[dict], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict]:
+        self._check_project_session(project_id, session_id)
         project = self.store.project_dir(project_id)
         if self._active_backend != "mock":
             return self._real_propagate(session_id, object_ids, start_frame, end_frame, direction, on_frame, should_cancel)
-        data = self.store.load(project_id, video_id)
-        ids = object_ids or [int(k) for k in data.get("objects", {}).keys()]
+        ids = object_ids or [int(k) for k in self.store.object_records(project_id, video_id)]
         frames: list[dict] = []
         frame_range = self._frame_range(start_frame, end_frame, direction)
         for frame_index in frame_range:
@@ -204,11 +253,17 @@ class SAMService:
                     break
                 if on_frame:
                     on_frame(frame)
-                frames.append(frame)
+                frames.append({'frame_index': frame_index} if on_frame else frame)
         return frames
 
+    @exclusive_inference
     def remove_object(self, project_id: str, session_id: str, object_id: int) -> None:
-        if self._active_backend == "mock" or not session_id:
+        self._check_project_session(project_id, session_id)
+        if not session_id:
+            return
+        if self._active_backend == 'mock':
+            record = self._sessions[session_id]
+            record['object_ids'] = [value for value in record.get('object_ids', []) if value != object_id]
             return
         if self._model is None:
             raise RuntimeError("SAM model is not loaded.")
@@ -217,43 +272,75 @@ class SAMService:
             "session_id": session_id,
             "obj_id": int(object_id),
         }
-        with self._torch_device_context():
+        with self._inference_context():
             self._model.handle_request(request)
+        record = self._sessions[session_id]
+        record['object_ids'] = [value for value in record.get('object_ids', []) if value != object_id]
 
+    @exclusive_inference
     def reset_session(self, project_id: str, session_id: str) -> None:
-        if self._active_backend == "mock":
-            self._sessions.pop(session_id, None)
-            return
-        if self._model is None:
-            raise RuntimeError("SAM model is not loaded.")
-        with self._torch_device_context():
-            self._model.handle_request({"type": "reset_session", "session_id": session_id})
+        self._check_project_session(project_id, session_id)
+        if self._active_backend != 'mock':
+            with self._inference_context():
+                self._model.handle_request({'type': 'reset_session', 'session_id': session_id})
+        self._sessions[session_id]['object_ids'] = []
 
+    def close_project_sessions(self, project_id: str) -> None:
+        if not any(session['project_id'] == project_id for session in self._sessions.values()):
+            return
+        if not self._inference_lock.acquire(blocking=False):
+            raise RuntimeError('Project inference is busy')
+        try:
+            for session_id, session in list(self._sessions.items()):
+                if session['project_id'] == project_id:
+                    self.close_session(project_id, session_id)
+        finally:
+            self._inference_lock.release()
+
+    @exclusive_inference
     def close_session(self, project_id: str, session_id: str) -> None:
+        self._check_project_session(project_id, session_id)
+        if self._model is not None:
+            with self._inference_context():
+                self._model.handle_request({'type': 'close_session', 'session_id': session_id})
         self._sessions.pop(session_id, None)
 
     def _start_real_session(self, frames_dir: str) -> str:
-        if self._active_backend == "sam3_multiplex_video":
-            init_kwargs: dict[str, Any] = {
-                "resource_path": frames_dir,
-                "offload_video_to_cpu": True,
-                "async_loading_frames": False,
-            }
-            if "video_loader_type" in inspect.signature(self._model.model.init_state).parameters:
-                init_kwargs["video_loader_type"] = getattr(self._model, "video_loader_type", "cv2")
-            with self._torch_device_context():
-                inference_state = self._model.model.init_state(**init_kwargs)
-            session_id = str(uuid.uuid4())
-            self._model._all_inference_states[session_id] = {
-                "state": inference_state,
-                "session_id": session_id,
-                "start_time": time.time(),
-                "last_use_time": time.time(),
-            }
-            return session_id
-        with self._torch_device_context():
-            response = self._model.handle_request({"type": "start_session", "resource_path": frames_dir, "offload_video_to_cpu": True})
-        return response["session_id"]
+        model = self._model.model
+        loader = LazyFrameLoader(frames_dir, model.image_size, model.image_mean,
+                                 model.image_std, self.config.sam_frame_cache_size)
+        kwargs: dict[str, Any] = {'resource_path': frames_dir, 'offload_video_to_cpu': True,
+                                  'async_loading_frames': False}
+        parameters = inspect.signature(model.init_state).parameters
+        if 'offload_state_to_cpu' in parameters:
+            kwargs['offload_state_to_cpu'] = self.config.sam_offload_state_to_cpu
+        if 'video_loader_type' in parameters:
+            kwargs['video_loader_type'] = getattr(self._model, 'video_loader_type', 'cv2')
+        # Preserve the official init_state, including subclass-specific state. Only
+        # replace its eager frame source while this serialized call is running.
+        with self._inference_context(), lazy_frame_source(model, loader):
+            inference_state = model.init_state(**kwargs)
+        session_id = str(uuid.uuid4())
+        self._model._all_inference_states[session_id] = {
+            'state': inference_state, 'session_id': session_id,
+            'start_time': time.time(), 'last_use_time': time.time(), 'frame_loader': loader}
+        return session_id
+
+    def _trim_feature_cache(self, session_id: str) -> None:
+        session = getattr(self._model, '_all_inference_states', {}).get(session_id, {})
+        cache = session.get('state', {}).get('feature_cache', {})
+        keys = [key for key in cache if isinstance(key, int)]
+        for key in keys[:-self.config.sam_feature_cache_size]:
+            cache.pop(key, None)
+
+    @contextmanager
+    def _inference_context(self):
+        import torch
+        with self._torch_device_context(), torch.inference_mode():
+            precision = {'float16': torch.float16, 'bfloat16': torch.bfloat16}.get(self.config.sam_precision)
+            autocast = torch.autocast(device_type='cuda', dtype=precision) if precision and self._active_device != 'cpu' else nullcontext()
+            with autocast:
+                yield
 
     def _close_real_sessions(self) -> None:
         if self._model is None or not hasattr(self._model, "_all_inference_states"):
@@ -382,10 +469,13 @@ class SAMService:
 
     def _run_real_prompt_request(self, frame_index: int, width: int, height: int, request: dict[str, Any]) -> list[dict]:
         self._log_real_prompt_request(frame_index, width, height, request)
-        with self._torch_device_context():
-            response = self._model.handle_request(request)
-        self._log_real_prompt_response(response.get("outputs", {}))
-        return self._results_from_outputs(frame_index, response.get("outputs", {}), width, height, self._source_name())
+        try:
+            with self._inference_context():
+                response = self._model.handle_request(request)
+                self._log_real_prompt_response(response.get("outputs", {}))
+                return self._results_from_outputs(frame_index, response.get("outputs", {}), width, height, self._source_name())
+        finally:
+            self._trim_feature_cache(request['session_id'])
 
     def _point_box_fallback_request(self, request: dict[str, Any], points: list[dict], width: int, height: int) -> dict[str, Any]:
         positives = [p for p in points if int(p.get("label", 1)) == 1]
@@ -473,11 +563,10 @@ class SAMService:
         abort_on_empty_start: bool,
         should_cancel: Callable[[], bool] | None = None,
     ) -> bool:
-        with self._torch_device_context():
-            import torch
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                for item in self._model.handle_stream_request(request):
+        with self._inference_context():
+            from contextlib import closing
+            with closing(self._model.handle_stream_request(request)) as stream:
+                for item in stream:
                     if should_cancel and should_cancel():
                         return False
                     frame_index = int(item["frame_index"])
@@ -498,9 +587,8 @@ class SAMService:
                     masks = outputs.get("out_binary_masks")
                     if masks is None:
                         continue
-                    masks_np = self._to_numpy(masks)
-                    if masks_np.ndim >= 3:
-                        height, width = masks_np.shape[-2], masks_np.shape[-1]
+                    if len(masks.shape) >= 3:
+                        height, width = masks.shape[-2], masks.shape[-1]
                     else:
                         height, width = 0, 0
                     results = self._results_from_outputs(frame_index, outputs, width, height, self._source_name(), propagation_object_ids)
@@ -510,7 +598,8 @@ class SAMService:
                             return False
                         if on_frame:
                             on_frame(frame)
-                        frames.append(frame)
+                        frames.append({'frame_index': frame_index} if on_frame else frame)
+                        self._trim_feature_cache(str(request['session_id']))
         return False
 
     def _is_empty_propagation_outputs(self, outputs: dict[str, Any]) -> bool:
@@ -616,6 +705,8 @@ class SAMService:
         return results
 
     def _log_real_prompt_request(self, frame_index: int, width: int, height: int, request: dict[str, Any]) -> None:
+        if not self.config.sam_debug_logging:
+            return
         prompt_type = "point" if request.get("points") is not None else ("box" if request.get("bounding_boxes") is not None else "text")
         details = {
             "backend": self._active_backend,
@@ -632,6 +723,8 @@ class SAMService:
         print(f"SAM prompt request: {details}", flush=True)
 
     def _log_real_prompt_response(self, outputs: dict[str, Any]) -> None:
+        if not self.config.sam_debug_logging:
+            return
         obj_ids = self._to_numpy(outputs.get("out_obj_ids", []))
         masks = self._to_numpy(outputs.get("out_binary_masks", []))
         boxes = self._to_numpy(outputs.get("out_boxes_xywh", []))
@@ -651,6 +744,8 @@ class SAMService:
         print(f"SAM prompt response: {details}", flush=True)
 
     def _log_propagate_item(self, frame_index: int, outputs: dict[str, Any]) -> None:
+        if not self.config.sam_debug_logging:
+            return
         obj_ids = self._to_numpy(outputs.get("out_obj_ids", []))
         masks = self._to_numpy(outputs.get("out_binary_masks", []))
         mask_sums = []
@@ -673,6 +768,8 @@ class SAMService:
         object_ids: list[int] | None,
         label: str,
     ) -> None:
+        if not self.config.sam_debug_logging:
+            return
         if self._active_backend != "sam3_multiplex_video" or self._model is None:
             return
         session = getattr(self._model, "_all_inference_states", {}).get(session_id)
@@ -788,12 +885,29 @@ class SAMService:
             return "sam3_video"
         return self._active_backend
 
+    def _configure_state_offload(self) -> None:
+        tracker = getattr(self._model.model, 'tracker', None)
+        if tracker is None or not hasattr(tracker, 'init_state'):
+            return
+        original = tracker.init_state
+        if 'offload_state_to_cpu' not in inspect.signature(original).parameters:
+            return
+        @wraps(original)
+        def init_state(*args, **kwargs):
+            kwargs.setdefault('offload_state_to_cpu', self.config.sam_offload_state_to_cpu)
+            return original(*args, **kwargs)
+        tracker.init_state = init_state
+
     def _configure_interactive_video_tracking(self) -> None:
         if self._active_backend != "sam3_multiplex_video" or self._model is None:
             return
         model = getattr(self._model, "model", None)
         if model is None:
             return
+        tracker = getattr(model, 'tracker', None)
+        if tracker is not None:
+            preserve_prompt_cache(tracker)
+            align_multiplex_devices(tracker)
         for name, value in {
             "hotstart_delay": 0,
             "masklet_confirmation_enable": False,

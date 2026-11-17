@@ -1,12 +1,14 @@
 from pathlib import Path
 import json
 import queue
+import asyncio
 import threading
 import traceback
+import logging
 import uuid
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -15,6 +17,7 @@ from app.schemas.sam import PropagateRequest, SegmentRequest
 from app.utils.mask import area_from_mask, bbox_from_mask, polygons_from_mask, save_mask_png
 from app.utils.paths import mask_path, project_dir, rel_to_project
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects/{project_id}/sam", tags=["sam"])
 _propagation_cancellations: dict[str, threading.Event] = {}
 
@@ -75,6 +78,26 @@ def _switch_backend(payload: BackendSwitchRequest) -> dict:
     }
 
 
+def _session_frames(project_id: str, video_id: str | None) -> str:
+    resolved = video_service.active_video_id(project_id, video_id)
+    base = video_service.video_path(project_id, resolved) if resolved else project_dir(settings.projects_dir, project_id)
+    return str(base / 'frames')
+
+
+def _check_video_session(project_id: str, session_id: str | None, video_id: str | None) -> None:
+    if session_id:
+        try:
+            sam_service.check_video_session(project_id, session_id, _session_frames(project_id, video_id))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+
+@router.get('/session')
+def current_session(project_id: str, video_id: str | None = Query(default=None)) -> dict:
+    return {'session': sam_service.find_video_session(project_id, _session_frames(project_id, video_id)),
+            'backend': sam_service.backend_name(), 'device': sam_service.device_name()}
+
+
 @router.post("/session")
 def start_session(project_id: str, video_id: str | None = Query(default=None)) -> dict:
     try:
@@ -89,6 +112,7 @@ def start_session(project_id: str, video_id: str | None = Query(default=None)) -
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "session_id": session_id,
+        "object_ids": (sam_service.find_video_session(project_id, str(base / 'frames')) or {}).get('object_ids', []),
         "backend": sam_service.backend_name(),
         "device": sam_service.device_name(),
         "video_supported": sam_service.is_video_supported(),
@@ -99,7 +123,7 @@ def start_session(project_id: str, video_id: str | None = Query(default=None)) -
 
 @router.post("/session/reset")
 def reset_session(project_id: str, payload: ResetSessionRequest, video_id: str | None = Query(default=None)) -> dict:
-    _ = video_service.active_video_id(project_id, video_id)
+    _check_video_session(project_id, payload.session_id, video_id)
     try:
         sam_service.reset_session(project_id, payload.session_id)
     except Exception as exc:
@@ -107,8 +131,18 @@ def reset_session(project_id: str, payload: ResetSessionRequest, video_id: str |
     return {"ok": True, "session_id": payload.session_id}
 
 
+@router.post("/session/close")
+def close_session(project_id: str, payload: ResetSessionRequest) -> dict:
+    try:
+        sam_service.close_session(project_id, payload.session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
+
+
 @router.post("/segment")
 def segment(project_id: str, payload: SegmentRequest, video_id: str | None = Query(default=None)) -> dict:
+    _check_video_session(project_id, payload.session_id, video_id)
     root = project_dir(settings.projects_dir, project_id)
     resolved_video_id = video_service.active_video_id(project_id, video_id)
     base = video_service.video_path(project_id, resolved_video_id) if resolved_video_id else root
@@ -134,6 +168,8 @@ def segment(project_id: str, payload: SegmentRequest, video_id: str | None = Que
             category=payload.category,
         )
     except Exception as exc:
+        logger.exception('SAM segmentation failed: project=%s video=%s session=%s frame=%s object=%s',
+                         project_id, resolved_video_id, payload.session_id, payload.frame_index, object_id)
         if created_object_id is not None:
             annotation_store.delete_object(project_id, created_object_id, resolved_video_id)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -173,23 +209,33 @@ def segment(project_id: str, payload: SegmentRequest, video_id: str | None = Que
 
 
 @router.post("/propagate")
-def propagate(project_id: str, payload: PropagateRequest, video_id: str | None = Query(default=None)) -> StreamingResponse:
+def propagate(project_id: str, payload: PropagateRequest, request: Request, video_id: str | None = Query(default=None)) -> StreamingResponse:
+    _check_video_session(project_id, payload.session_id, video_id)
     resolved_video_id = video_service.active_video_id(project_id, video_id)
-    events: queue.Queue[dict] = queue.Queue()
+    events: queue.Queue[dict] = queue.Queue(maxsize=8)
+    disconnected = threading.Event()
     cancel_key = _propagation_cancel_key(project_id, payload.session_id, resolved_video_id)
     cancel_event = threading.Event()
     _propagation_cancellations[cancel_key] = cancel_event
     request_id = uuid.uuid4().hex
 
+    def publish(event: dict) -> None:
+        while not disconnected.is_set():
+            try:
+                events.put(event, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
     def worker() -> None:
-        output_frames: dict[int, dict] = {}
+        output_frames: set[int] = set()
 
         def save_propagated_frame(frame: dict) -> None:
             if cancel_event.is_set():
                 return
             saved = _save_propagated_frame(project_id, frame, resolved_video_id)
-            output_frames[int(saved["frame_index"])] = saved
-            events.put({"type": "frame", "frame": saved})
+            output_frames.add(int(saved["frame_index"]))
+            publish({"type": "frame", "frame": saved})
 
         try:
             sam_service.propagate_in_video(
@@ -204,27 +250,35 @@ def propagate(project_id: str, payload: PropagateRequest, video_id: str | None =
                 should_cancel=cancel_event.is_set,
             )
             event_type = "cancelled" if cancel_event.is_set() else "done"
-            events.put({
+            publish({
                 "type": event_type,
                 "backend": sam_service.backend_name(),
-                "frames": [output_frames[index] for index in sorted(output_frames)],
+                "frames": [],
+                "frame_count": len(output_frames),
                 "request_id": request_id,
             })
         except Exception as exc:
             traceback.print_exc()
-            events.put({"type": "error", "detail": str(exc)})
+            publish({"type": "error", "detail": str(exc)})
         finally:
             existing = _propagation_cancellations.get(cancel_key)
             if existing is cancel_event:
                 _propagation_cancellations.pop(cancel_key, None)
 
-    def stream():
+    async def stream():
         threading.Thread(target=worker, daemon=True).start()
-        while True:
-            event = events.get()
-            yield json.dumps(event, ensure_ascii=False) + "\n"
-            if event["type"] in {"done", "cancelled", "error"}:
-                break
+        try:
+            while not await request.is_disconnected():
+                try:
+                    event = await asyncio.to_thread(events.get, True, 0.25)
+                except queue.Empty:
+                    continue
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+                if event['type'] in {'done', 'cancelled', 'error'}:
+                    break
+        finally:
+            disconnected.set()
+            cancel_event.set()
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
@@ -242,12 +296,14 @@ def cancel_propagation(project_id: str, payload: CancelPropagationRequest, video
 
 def _save_propagated_frame(project_id: str, frame: dict, video_id: str | None) -> dict:
     objects = {}
+    annotations = []
     for result in frame["objects"]:
         path = mask_path(settings.projects_dir, project_id, result["object_id"], frame["frame_index"], video_id)
         save_mask_png(result["mask"], path)
         ann = _annotation(project_id, result, path, is_keyframe=False)
-        annotation_store.save_frame_object(project_id, frame["frame_index"], ann, is_keyframe=False, video_id=video_id)
+        annotations.append(ann)
         objects[str(result["object_id"])] = {**ann, "mask_url": _mask_url(project_id, result["object_id"], frame["frame_index"], video_id)}
+    annotation_store.save_frame_objects(project_id, frame['frame_index'], annotations, is_keyframe=False, video_id=video_id)
     return {"frame_index": frame["frame_index"], "objects": objects}
 
 

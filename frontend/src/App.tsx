@@ -1,3 +1,4 @@
+import AccountGate from "./components/AccountGate";
 import AnnotationPanel from "./components/AnnotationPanel";
 import { useEffect } from "react";
 import ObjectPanel from "./components/ObjectPanel";
@@ -11,11 +12,15 @@ import { useAnnotationStore } from "./store/annotationStore";
 import { useProjectStore } from "./store/projectStore";
 
 export default function App() {
+  return <AccountGate><Workspace /></AccountGate>;
+}
+
+function Workspace() {
   const project = useProjectStore((state) => state.project);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (isEditableTarget(event.target)) return;
+      if (isEditableTarget(event.target) || document.querySelector("[data-project-management], .account-modal")) return;
       const key = event.key.toLowerCase();
       const state = useAnnotationStore.getState();
       if (key === "a") {

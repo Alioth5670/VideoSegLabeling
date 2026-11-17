@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -21,7 +23,7 @@ def register_project_dir(projects_dir: Path, project_id: str, root: Path) -> Non
     projects_dir.mkdir(parents=True, exist_ok=True)
     paths = load_project_paths(projects_dir)
     paths[project_id] = str(root.resolve())
-    registry_path(projects_dir).write_text(json.dumps(paths, indent=2, ensure_ascii=False), encoding="utf-8")
+    _save_project_paths(projects_dir, paths)
 
 
 def project_root(projects_dir: Path, project_id: str) -> Path:
@@ -29,3 +31,20 @@ def project_root(projects_dir: Path, project_id: str) -> Path:
     if registered:
         return Path(registered)
     return projects_dir / project_id
+
+
+def _save_project_paths(projects_dir: Path, paths: dict[str, str]) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix='.project-paths-', suffix='.json', dir=projects_dir)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as out:
+            json.dump(paths, out, indent=2, ensure_ascii=False)
+        os.replace(temporary, registry_path(projects_dir))
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def unregister_project_dir(projects_dir: Path, project_id: str) -> None:
+    paths = load_project_paths(projects_dir)
+    if project_id in paths:
+        paths.pop(project_id)
+        _save_project_paths(projects_dir, paths)

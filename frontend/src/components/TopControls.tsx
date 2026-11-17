@@ -1,8 +1,9 @@
+import { isCurrentProject } from "../utils/project";
 import { BoxSelect, CircleMinus, CirclePlus, MousePointer2, PencilLine, Play, RectangleHorizontal, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
 import axios from "axios";
 import { getHealth } from "../api/health";
-import { resetSession, startSession } from "../api/sam";
+import { getVideoSession, resetSession, startSession } from "../api/sam";
 import { useAnnotationStore } from "../store/annotationStore";
 import { useProjectStore } from "../store/projectStore";
 
@@ -22,13 +23,39 @@ export default function TopControls() {
       .catch(() => state.setBackend("unreachable"));
   }, []);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    const annotation = useAnnotationStore.getState();
+    annotation.clearSession();
+    setMessage("");
+    if (!project) return;
+    const current = project;
+    getVideoSession(current.projectId, current.activeVideoId, controller.signal).then(result => {
+      if (controller.signal.aborted || !isCurrentProject(current.projectId, current.activeVideoId)) return;
+      if (result.session) {
+        const store = useAnnotationStore.getState();
+        if (store.sessionId && store.sessionId !== result.session.session_id) return;
+        store.setSession(result.session.session_id, result.backend);
+        store.addSessionObjectIds(result.session.object_ids);
+        store.setSamDevice(result.device);
+        setMessage("已恢复当前视频的 session");
+      }
+    }).catch(error => {
+      if (!controller.signal.aborted && isCurrentProject(current.projectId, current.activeVideoId)) setMessage(errorMessage(error));
+    });
+    return () => controller.abort();
+  }, [project?.projectId, project?.activeVideoId]);
+
   async function onSession() {
     if (!project) return;
     setBusy("session");
     setMessage("Loading SAM session...");
     try {
       const session = await startSession(project.projectId, project.activeVideoId);
+      if (!isCurrentProject(project.projectId, project.activeVideoId)) return;
       state.setSession(session.session_id, session.backend);
+      state.resetSessionObjects();
+      state.addSessionObjectIds(session.object_ids);
       state.setSamDevice(session.device);
       setMessage(session.fallback_error ?? `Session ready: ${session.backend} on ${session.device}`);
     } catch (error) {
@@ -46,6 +73,7 @@ export default function TopControls() {
     setMessage("Resetting SAM session...");
     try {
       await resetSession(project.projectId, state.sessionId, project.activeVideoId);
+      if (!isCurrentProject(project.projectId, project.activeVideoId)) return;
       state.resetSessionObjects();
       setMessage("Session reset. Existing annotations are kept; add prompts again to track objects.");
     } catch (error) {

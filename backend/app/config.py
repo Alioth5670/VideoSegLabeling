@@ -14,6 +14,10 @@ class Settings:
     sam_backend: str
     sam_precision: str
     sam_device: str
+    sam_frame_cache_size: int = 8
+    sam_feature_cache_size: int = 4
+    sam_offload_state_to_cpu: bool = True
+    sam_debug_logging: bool = False
 
 
 @lru_cache
@@ -27,6 +31,10 @@ def get_settings() -> Settings:
         sam31_checkpoint_path=Path(
             os.getenv("SAM31_CHECKPOINT_PATH", project_root / "checkpoints" / "sam3.1_multiplex.pt")
         ),
+        sam_debug_logging=os.getenv("SAM_DEBUG_LOGGING", "false").lower() == "true",
+        sam_frame_cache_size=max(1, int(os.getenv("SAM_FRAME_CACHE_SIZE", "8"))),
+        sam_feature_cache_size=max(1, int(os.getenv("SAM_FEATURE_CACHE_SIZE", "4"))),
+        sam_offload_state_to_cpu=os.getenv("SAM_OFFLOAD_STATE_TO_CPU", "true").lower() == "true",
         sam_backend=os.getenv("SAM_BACKEND", "mock"),
         sam_precision=os.getenv("SAM_PRECISION", "bfloat16"),
         sam_device=os.getenv("SAM_DEVICE", os.getenv("SAM_CUDA_DEVICE", "cuda:0")),

@@ -60,11 +60,11 @@ def get_overlay(project_id: str, frame_index: int, video_id: str | None = Query(
     frame_path = base / "frames" / f"{frame_index:06d}.jpg"
     if not frame_path.exists():
         raise HTTPException(status_code=404, detail="Frame not found")
-    annotations = annotation_store.load(project_id, resolved_video_id)
+    objects = annotation_store.object_records(project_id, resolved_video_id)
     masks = []
-    frame = annotations.get("frames", {}).get(str(frame_index), {"objects": {}})
+    frame = annotation_store.frame_annotations(project_id, frame_index, resolved_video_id)
     for object_id, ann in frame.get("objects", {}).items():
-        obj = annotations.get("objects", {}).get(str(object_id), {})
+        obj = objects.get(str(object_id), {})
         if not obj.get("visible", True):
             continue
         mask_file = root / ann["mask_path"]

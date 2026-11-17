@@ -1,11 +1,14 @@
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from urllib.parse import urlsplit
+import re
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import annotations, exports, projects, sam, videos
-from app.api.deps import sam_service
+from app.api import annotations, auth, exports, projects, sam, videos
+from app.api.deps import sam_service, account_store, video_service, export_jobs
 from app.config import get_settings
 
 
@@ -20,13 +23,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def protect_data(request: Request, call_next):
+    path = request.url.path
+    if path == "/projects" or path.startswith("/projects/"):
+        return JSONResponse({"detail": "请使用受保护的项目 API"}, status_code=404)
+    if path.startswith("/api/"):
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin")
+            if origin and urlsplit(origin).netloc != request.headers.get("host"):
+                return JSONResponse({"detail": "不允许跨站修改数据"}, status_code=403)
+        public = {"/api/auth/status", "/api/auth/setup", "/api/auth/login"}
+        if path not in public:
+            user = account_store.current_user(request.cookies.get(auth.COOKIE, ""))
+            if not user:
+                return JSONResponse({"detail": "请先登录"}, status_code=401)
+            request.state.user = user
+            match = re.match(r"^/api/projects/([^/]+)", path)
+            if match:
+                restoring = request.method == 'POST' and path == f'/api/projects/{match[1]}/restore'
+                purging = request.method == 'DELETE' and path == f'/api/projects/{match[1]}/permanent'
+                record = account_store.project_record(match[1], include_deleted=restoring or purging)
+                if not record or (not user['admin'] and record['owner_id'] != user['id']):
+                    return JSONResponse({'detail': '项目不存在'}, status_code=404)
+            if match:
+                video_id = request.query_params.get("video_id")
+                if video_id:
+                    project = video_service.load_project(match[1])
+                    if not any(v.get("video_id") == video_id for v in project.get("videos", [])):
+                        return JSONResponse({"detail": "视频不存在"}, status_code=404)
+            if (path.startswith("/api/sam/") or path.endswith("/sam/backend")) and not user["admin"]:
+                return JSONResponse({"detail": "需要管理员权限"}, status_code=403)
+    response = await call_next(request)
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+app.include_router(auth.router)
 app.include_router(projects.router)
 app.include_router(videos.router)
 app.include_router(sam.status_router)
 app.include_router(sam.router)
 app.include_router(annotations.router)
 app.include_router(exports.router)
-app.mount("/projects", StaticFiles(directory=str(settings.projects_dir)), name="projects")
+
+
+
+@app.on_event("shutdown")
+def stop_export_workers() -> None:
+    export_jobs.shutdown()
 
 
 @app.get("/api/health")

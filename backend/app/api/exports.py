@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from app.api.deps import export_service, settings
+from app.api.deps import export_jobs, settings
 from app.utils.paths import project_dir
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["exports"])
@@ -10,16 +10,25 @@ router = APIRouter(prefix="/api/projects/{project_id}", tags=["exports"])
 
 class ExportRequest(BaseModel):
     format: str
+    video_id: str | None = None
 
 
-@router.post("/export")
+@router.post("/export", status_code=202)
 def export(project_id: str, payload: ExportRequest) -> dict:
     try:
-        path = export_service.export(project_id, payload.format)
-    except Exception as exc:
+        return export_jobs.submit(project_id, payload.format, payload.video_id)
+    except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    rel = path.relative_to(project_dir(settings.projects_dir, project_id)).as_posix()
-    return {"download_url": f"/api/projects/{project_id}/download/{rel}"}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+
+@router.get("/export/{job_id}")
+def export_status(project_id: str, job_id: str) -> dict:
+    try:
+        return export_jobs.get(project_id, job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Export task not found") from exc
 
 
 @router.get("/download/{path:path}")

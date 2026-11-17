@@ -87,7 +87,7 @@ export const useAnnotationStore = create<AnnotationState>((set) => ({
       selectedPrompt: null
     };
   }),
-  setSession: (sessionId, backend) => set({ sessionId, backend, sessionObjectIds: [] }),
+  setSession: (sessionId, backend) => set(current => ({ sessionId, backend, sessionObjectIds: current.sessionId === sessionId ? current.sessionObjectIds : [] })),
   clearSession: () => set({ sessionId: undefined, sessionObjectIds: [] }),
   resetSessionObjects: () => set({ sessionObjectIds: [] }),
   addSessionObjectIds: (ids) => set((state) => ({

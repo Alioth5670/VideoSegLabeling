@@ -18,7 +18,7 @@ def video_dir(projects_dir: Path, project_id: str, video_id: str | None = None) 
         for video in project.get("videos", []):
             if video.get("video_id") == video_id:
                 return root / (video.get("storage_dir") or f"videos/{video_id}")
-    return root / "videos" / video_id
+    raise ValueError("Video does not belong to this project")
 
 
 def frame_path(projects_dir: Path, project_id: str, frame_index: int, video_id: str | None = None) -> Path:

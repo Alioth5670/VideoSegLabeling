@@ -1,18 +1,18 @@
 import { api } from "./client";
 
-export async function createProject(name: string, projectDir?: string) {
-  const { data } = await api.post("/projects", { name, project_dir: projectDir || undefined });
+export async function createProject(name: string, projectDir?: string, ownerId?: string) {
+  const { data } = await api.post("/projects", { name, project_dir: projectDir || undefined, owner_id: ownerId });
   return data as { project_id: string; name: string };
 }
 
 export async function getProject(projectId: string, videoId?: string) {
-  const { data } = await api.get(`/projects/${projectId}`, { params: videoId ? { video_id: videoId } : undefined });
+  const { data } = await api.get(`/projects/${projectId}`, { params: { summary: true, ...(videoId ? { video_id: videoId } : {}) } });
   return data;
 }
 
-export async function listProjects() {
-  const { data } = await api.get("/projects");
-  return data as { projects: any[] };
+export async function listProjects(q = "", offset = 0, limit = 50, options?: { owner_id?: string; all_accounts?: boolean; deleted?: boolean }) {
+  const { data } = await api.get("/projects", { params: { q, offset, limit, ...options } });
+  return data as { projects: ProjectSummary[]; total: number };
 }
 
 export async function uploadVideo(projectId: string, file: File, relativePath?: string) {
@@ -42,7 +42,7 @@ export async function uploadVideoFolder(projectId: string, files: File[], option
 }
 
 export async function activateVideo(projectId: string, videoId: string) {
-  const { data } = await api.post(`/projects/${projectId}/videos/${videoId}/activate`, {});
+  const { data } = await api.post(`/projects/${projectId}/videos/${videoId}/activate`, {}, { params: { summary: true } });
   return data;
 }
 
@@ -72,4 +72,38 @@ export async function deleteObject(projectId: string, objectId: number, videoId?
   };
   const { data } = await api.delete(`/projects/${projectId}/objects/${objectId}`, { params });
   return data;
+}
+
+
+export interface ProjectSummary {
+  project_id: string;
+  name: string;
+  owner_id: string;
+  owner_username: string;
+  updated_at: string;
+  deleted_at?: string | null;
+  data_status?: "available" | "missing";
+  missing_reason?: string | null;
+}
+
+export async function renameProject(projectId: string, name: string) {
+  const { data } = await api.patch(`/projects/${projectId}`, { name });
+  return data as ProjectSummary;
+}
+
+export async function recycleProject(projectId: string) {
+  await api.delete(`/projects/${projectId}`);
+}
+
+export async function restoreProject(projectId: string) {
+  await api.post(`/projects/${projectId}/restore`);
+}
+
+export async function transferProject(projectId: string, ownerId: string) {
+  await api.post(`/projects/${projectId}/transfer`, { owner_id: ownerId });
+}
+
+
+export async function permanentlyDeleteProject(projectId: string, confirmationName: string) {
+  await api.delete(`/projects/${projectId}/permanent`, { data: { confirmation_name: confirmationName } });
 }
